@@ -1,0 +1,6 @@
+# Force LF on all distributed text files so published SHA-256 hashes stay
+# reproducible across platforms (and the shell script runs on Linux).
+* text=auto
+*.sh        text eol=lf
+*.ps1       text eol=lf
+SHA256SUMS  text eol=lf
