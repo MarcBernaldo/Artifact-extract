@@ -9,8 +9,10 @@ The output layout reproduces the source volume (Windows) and filesystem (Linux) 
 original paths, so the collection can be ingested by
 [Artifact Engine](https://github.com/MarcBernaldo/Artifact-Engine) without modification.
 
-> Status: **v1 — quick triage**. Locked-file acquisition (`$MFT`, SRUM, Amcache via VSS)
-> and memory acquisition are declared out of scope for v1 and stubbed behind flags.
+> Status: **triage collector**. Locked files (registry hives + transaction logs, Amcache,
+> SRUM, NTUSER/UsrClass, browser history, WMI repository) are acquired on Windows via a
+> Volume Shadow Copy when elevated. Raw NTFS (`$MFT`, `$UsnJrnl`, `$LogFile`) and memory
+> acquisition remain out of scope.
 
 ## Usage
 
@@ -133,9 +135,12 @@ chain-of-custody verification after the fact.
 > Regenerate `SHA256SUMS` whenever a script changes — a stale hash will fail verification and
 > will not match an allowlist entry.
 
-## Scope & honest limitations (v1)
+## Scope & honest limitations
 
-- `$MFT`, USN journal, and locked hives via VSS/`esentutl` — **deferred** (Phase 4).
+- Locked files (Amcache, SRUM, NTUSER.DAT/UsrClass.dat, hive `.LOG1/.LOG2`, browser
+  history, WMI repository) — acquired on Windows via a single Volume Shadow Copy, **elevated
+  only**; without elevation they are marked `skipped` in the manifest.
+- Raw NTFS (`$MFT`, `$UsnJrnl:$J`, `$LogFile`) — **deferred** (needs a raw-NTFS reader).
 - Memory acquisition — **stubbed**; no reliable native-only path, documented as such.
 - Several disk steps use LOLBin techniques (`reg save HKLM\SAM`, …) that some EDR/AV flag.
   In authorized DFIR this is expected; failing steps are logged and never abort the run.

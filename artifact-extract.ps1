@@ -176,6 +176,69 @@ function Add-DiskTree {
     }
 }
 
+# --- Wave 2: locked-file acquisition via a single Volume Shadow Copy (elevated only) ---
+
+# Create a ClientAccessible shadow copy of C: and symlink it under %TEMP%.
+# Win32_ShadowCopy.Create works on Windows client (unlike 'vssadmin create shadow', Server-only).
+# Returns @{ Link; Wmi } or $null on failure.
+function New-ShadowSnapshot {
+    try {
+        $r = ([wmiclass]'root\cimv2:Win32_ShadowCopy').Create('C:\', 'ClientAccessible')
+        if ($r.ReturnValue -ne 0) { return $null }
+        $sc = Get-WmiObject Win32_ShadowCopy | Where-Object { $_.ID -eq $r.ShadowID }
+        if (-not $sc) { return $null }
+        $link = Join-Path $env:TEMP ('aeng_vss_' + [guid]::NewGuid().ToString('N'))
+        # Device path has no spaces; leave it unquoted so the trailing '\' is not read as an escape.
+        cmd /c mklink /d "$link" $($sc.DeviceObject)\ > $null 2>&1
+        if (-not (Test-Path -LiteralPath $link)) { try { $sc.Delete() } catch {}; return $null }
+        return @{ Link = $link; Wmi = $sc }
+    }
+    catch { return $null }
+}
+
+function Remove-ShadowSnapshot {
+    param($Snap)
+    if (-not $Snap) { return }
+    try { if (Test-Path -LiteralPath $Snap.Link) { cmd /c rmdir "$($Snap.Link)" > $null 2>&1 } } catch {}
+    try { $Snap.Wmi.Delete() } catch {}
+}
+
+# Copy one file (path relative to C:\) out of the shadow copy into the C\ tree.
+function Add-ShadowFile {
+    param($Snap, [string]$Rel)
+    $src = Join-Path $Snap.Link $Rel
+    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { return }
+    $target = Join-Path $outRoot (Join-Path 'C' $Rel)
+    Invoke-Step -Action 'vss_copy' -Category 'disk' -Command "vss copy C:\$Rel" -Target $target `
+        -Script { Copy-Item -LiteralPath $src -Destination $target -Force }
+}
+
+# Copy files matching a wildcard pattern (relative to C:\) out of the shadow copy.
+function Add-ShadowGlob {
+    param($Snap, [string]$RelPattern)
+    Get-ChildItem -Path (Join-Path $Snap.Link $RelPattern) -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        $src = $_.FullName
+        $rel = $src.Substring($Snap.Link.Length).TrimStart('\')
+        $target = Join-Path $outRoot (Join-Path 'C' $rel)
+        Invoke-Step -Action 'vss_copy' -Category 'disk' -Command "vss copy $rel" -Target $target `
+            -Script { Copy-Item -LiteralPath $src -Destination $target -Force }
+    }
+}
+
+# Copy a whole directory tree out of the shadow copy (e.g. the WMI repository).
+function Add-ShadowTree {
+    param($Snap, [string]$RelRoot)
+    $root = Join-Path $Snap.Link $RelRoot
+    if (-not (Test-Path -LiteralPath $root)) { return }
+    Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        $src = $_.FullName
+        $rel = $src.Substring($Snap.Link.Length).TrimStart('\')
+        $target = Join-Path $outRoot (Join-Path 'C' $rel)
+        Invoke-Step -Action 'vss_copy' -Category 'disk' -Command "vss copy $rel" -Target $target `
+            -Script { Copy-Item -LiteralPath $src -Destination $target -Force }
+    }
+}
+
 function Collect-Disk {
     Write-Log "Collecting disk artifacts (C\ volume layout) [profile=$Profile]"
     $sys32 = Join-Path $outRoot 'C\Windows\System32'
@@ -247,7 +310,55 @@ function Collect-Disk {
         Add-DiskTree -Root 'C:\ProgramData\Microsoft\Windows\WER\ReportArchive'
         Add-DiskTree -Root 'C:\ProgramData\Microsoft\Windows\WER\ReportQueue'
     }
-    # NOTE: $MFT / USN / NTUSER.DAT / UsrClass.dat / Amcache / SRUM (locked) -> Wave 2 (VSS/esentutl).
+    # --- Locked files via a single Volume Shadow Copy (Wave 2; elevated only) ---
+    if (-not $script:IsElevated) {
+        Write-Manifest -Action 'vss_snapshot' -Command 'n/a' -Target $null -Category 'disk' `
+            -ExitCode $null -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'skipped' `
+            -Message 'locked-file acquisition (Amcache/SRUM/NTUSER/UsrClass/transaction logs/browser) requires elevation'
+        Write-Log '  locked files skipped - run elevated to acquire them' 'WARN'
+    }
+    else {
+        Write-Log 'Acquiring locked files via Volume Shadow Copy...'
+        $snap = New-ShadowSnapshot
+        if (-not $snap) {
+            Write-Manifest -Action 'vss_snapshot' -Command 'Win32_ShadowCopy.Create' -Target $null -Category 'disk' `
+                -ExitCode $null -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'degraded' `
+                -Message 'could not create/mount a shadow copy'
+            Write-Log '  VSS snapshot unavailable - locked files skipped' 'WARN'
+        }
+        else {
+            try {
+                # Registry transaction logs (the hives themselves come from reg save above)
+                foreach ($h in 'SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY', 'DEFAULT') {
+                    Add-ShadowFile $snap "Windows\System32\config\$h.LOG1"
+                    Add-ShadowFile $snap "Windows\System32\config\$h.LOG2"
+                }
+                Add-ShadowFile $snap 'Windows\System32\config\DEFAULT'
+                # Execution artifacts (ESE / hive)
+                Add-ShadowFile $snap 'Windows\AppCompat\Programs\Amcache.hve'
+                Add-ShadowFile $snap 'Windows\AppCompat\Programs\Amcache.hve.LOG1'
+                Add-ShadowFile $snap 'Windows\AppCompat\Programs\Amcache.hve.LOG2'
+                Add-ShadowFile $snap 'Windows\System32\sru\SRUDB.dat'
+                # Per-user hives (UserAssist / MRU / Shellbags) + browser history
+                Get-ChildItem 'C:\Users' -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                    $rel = "Users\$($_.Name)"
+                    Add-ShadowFile $snap "$rel\NTUSER.DAT"
+                    Add-ShadowFile $snap "$rel\NTUSER.DAT.LOG1"
+                    Add-ShadowFile $snap "$rel\NTUSER.DAT.LOG2"
+                    Add-ShadowFile $snap "$rel\AppData\Local\Microsoft\Windows\UsrClass.dat"
+                    Add-ShadowFile $snap "$rel\AppData\Local\Microsoft\Windows\UsrClass.dat.LOG1"
+                    Add-ShadowFile $snap "$rel\AppData\Local\Microsoft\Windows\UsrClass.dat.LOG2"
+                    Add-ShadowFile $snap "$rel\AppData\Local\Google\Chrome\User Data\Default\History"
+                    Add-ShadowFile $snap "$rel\AppData\Local\Microsoft\Edge\User Data\Default\History"
+                    Add-ShadowGlob $snap "$rel\AppData\Roaming\Mozilla\Firefox\Profiles\*\places.sqlite"
+                }
+                # WMI repository (fileless persistence) - larger, full profile only
+                if ($Profile -eq 'full') { Add-ShadowTree $snap 'Windows\System32\wbem\Repository' }
+            }
+            finally { Remove-ShadowSnapshot $snap }
+        }
+    }
+    # NOTE: raw NTFS ($MFT / $UsnJrnl:$J / $LogFile) -> Wave 3 (raw-NTFS reader).
 }
 
 function Collect-Volatile {
