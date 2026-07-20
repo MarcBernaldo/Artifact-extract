@@ -145,27 +145,72 @@ copy_artifact() {
 # ==================================================================================
 #  Collection modules
 # ==================================================================================
+# Copy every file under a directory tree into [root]/ (bounded depth).
+copy_tree() {
+    [ -d "$1" ] || return 0
+    find "$1" -maxdepth "${2:-6}" -type f 2>/dev/null | while IFS= read -r f; do copy_artifact "$f"; done
+}
+
 collect_disk() {
     log "Collecting disk artifacts ([root]/ filesystem layout) [profile=$PROFILE]"
-    # Identity / config
-    for f in /etc/hostname /etc/os-release /etc/passwd /etc/group /etc/hosts \
-             /etc/crontab /etc/sudoers /etc/ssh/sshd_config; do
+
+    # --- Identity / system config ---
+    for f in /etc/hostname /etc/machine-id /etc/timezone /etc/os-release \
+             /etc/passwd /etc/group /etc/hosts /etc/resolv.conf \
+             /etc/crontab /etc/cron.allow /etc/cron.deny \
+             /etc/sudoers /etc/ssh/sshd_config /etc/ssh/ssh_config; do
         copy_artifact "$f"
     done
-    [ "$IS_ROOT" = 1 ] && copy_artifact /etc/shadow
-    # Auth / login logs and accounting (raw - parsed by the Engine)
-    for f in /var/log/auth.log /var/log/secure /var/log/wtmp /var/log/btmp \
-             /var/log/lastlog /var/log/syslog /var/log/messages /var/log/cron; do
+    [ "$IS_ROOT" = 1 ] && { copy_artifact /etc/shadow; copy_artifact /etc/gshadow; }
+    copy_tree /etc/sudoers.d 1
+
+    # --- Logs: auth, accounting, audit, package, syslog (incl. rotations) ---
+    for f in /var/log/auth.log* /var/log/secure* /var/log/syslog* /var/log/messages* \
+             /var/log/cron* /var/log/kern.log* /var/log/faillog /var/log/lastlog \
+             /var/log/wtmp* /var/log/btmp* /var/log/audit/audit.log* \
+             /var/log/dpkg.log* /var/log/yum.log* /var/log/dnf.log* \
+             /var/log/apt/history.log* /var/log/apt/term.log*; do
         copy_artifact "$f"
     done
-    # Persistence: cron dirs, systemd units, shell profiles
-    for d in /etc/cron.d /etc/cron.daily /etc/cron.hourly /var/spool/cron; do
-        [ -d "$d" ] && find "$d" -type f 2>/dev/null | while IFS= read -r f; do copy_artifact "$f"; done
+    # Web server logs (webshell / HTTP evidence)
+    for d in /var/log/apache2 /var/log/httpd /var/log/nginx; do copy_tree "$d" 3; done
+
+    # --- Persistence: cron, systemd, rc/init, PAM, ld.so, MOTD ---
+    for d in /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly \
+             /var/spool/cron /var/spool/cron/crontabs; do
+        copy_tree "$d" 2
     done
-    if [ "$PROFILE" = full ]; then
-        for d in /etc/systemd/system /lib/systemd/system; do
-            [ -d "$d" ] && find "$d" -maxdepth 1 -type f -name '*.service' 2>/dev/null | while IFS= read -r f; do copy_artifact "$f"; done
+    for d in /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system /etc/systemd/user; do
+        [ -d "$d" ] && find "$d" -maxdepth 2 -type f \( -name '*.service' -o -name '*.timer' \) 2>/dev/null \
+            | while IFS= read -r f; do copy_artifact "$f"; done
+    done
+    copy_artifact /etc/rc.local
+    copy_artifact /etc/ld.so.preload         # any entry here is a critical rootkit red flag
+    for d in /etc/ld.so.conf.d /etc/init.d /etc/rc.d /etc/update-motd.d /etc/pam.d /lib/security; do
+        copy_tree "$d" 1
+    done
+
+    # --- Per-user: SSH keys, shell init files, shell history ---
+    for home in /root /home/*; do
+        [ -d "$home" ] || continue
+        for f in "$home/.ssh/authorized_keys" "$home/.ssh/authorized_keys2" \
+                 "$home/.ssh/known_hosts" "$home/.ssh/config" \
+                 "$home/.bashrc" "$home/.bash_profile" "$home/.profile" "$home/.bash_logout" \
+                 "$home/.zshrc" "$home/.zprofile" \
+                 "$home/.bash_history" "$home/.zsh_history" "$home/.sh_history" \
+                 "$home/.python_history" "$home/.mysql_history" "$home/.psql_history" \
+                 "$home/.viminfo" "$home/.lesshst"; do
+            copy_artifact "$f"
         done
+        for pub in "$home"/.ssh/*.pub; do copy_artifact "$pub"; done
+    done
+    copy_artifact /etc/profile
+    copy_artifact /etc/bash.bashrc
+    copy_tree /etc/profile.d 1
+
+    # --- Larger sources: raw journald (full profile only, size) ---
+    if [ "$PROFILE" = full ]; then
+        for d in /var/log/journal /run/log/journal; do copy_tree "$d" 4; done
     fi
     # NOTE: full-disk timeline artifacts deferred; v1 is targeted triage.
 }
@@ -174,27 +219,64 @@ collect_volatile() {
     log 'Collecting volatile artifacts (live captures)'
     LR="$OUT_ROOT/live_response"
 
+    # --- System ---
     run_step system_info 'uname -a' "$LR/system/uname.txt" volatile uname -a
     run_step date_utc 'date -u' "$LR/system/date_utc.txt" volatile sh -c "date -u; echo \"tz=$TZ_NAME offset=$UTC_OFFSET\""
+    run_step uptime 'uptime' "$LR/system/uptime.txt" volatile sh -c 'uptime 2>/dev/null; echo; cat /proc/uptime 2>/dev/null'
+
+    # --- Processes (incl. per-PID /proc detail to flag deleted/fileless binaries) ---
     run_step processes 'ps -ef' "$LR/process/ps.txt" volatile ps -ef
     run_step process_tree 'ps auxww' "$LR/process/ps_auxww.txt" volatile ps auxww
+    run_step proc_detail '/proc/<pid>/{exe,cmdline,cwd}' "$LR/process/proc_detail.txt" volatile sh -c '
+        for p in /proc/[0-9]*; do
+          pid=${p#/proc/}
+          exe=$(readlink "$p/exe" 2>/dev/null)
+          cwd=$(readlink "$p/cwd" 2>/dev/null)
+          cmd=$(tr "\0" " " < "$p/cmdline" 2>/dev/null)
+          [ -n "$exe$cmd" ] && printf "PID=%s EXE=%s CWD=%s CMD=%s\n" "$pid" "$exe" "$cwd" "$cmd"
+        done'
 
+    # --- Network ---
     if have ss; then run_step network 'ss -tunap' "$LR/network/connections.txt" volatile ss -tunap
     elif have netstat; then run_step network 'netstat -tunap' "$LR/network/connections.txt" volatile netstat -tunap
     else manifest network 'ss|netstat' - volatile - 0 '' 0 skipped 'no ss/netstat available'; fi
-
-    if have ip; then run_step interfaces 'ip addr' "$LR/network/interfaces.txt" volatile ip addr
-    elif have ifconfig; then run_step interfaces 'ifconfig -a' "$LR/network/interfaces.txt" volatile ifconfig -a; fi
-
-    run_step logins 'last' "$LR/system/last.txt" volatile sh -c 'last 2>/dev/null || true'
-    run_step who 'who -a' "$LR/system/who.txt" volatile sh -c 'who -a 2>/dev/null || who'
+    if have ip; then
+        run_step interfaces 'ip addr' "$LR/network/interfaces.txt" volatile ip addr
+        run_step routes 'ip route' "$LR/network/routes.txt" volatile ip route
+        run_step arp_cache 'ip neigh' "$LR/network/arp.txt" volatile ip neigh
+    elif have ifconfig; then
+        run_step interfaces 'ifconfig -a' "$LR/network/interfaces.txt" volatile ifconfig -a
+    fi
+    run_step firewall 'iptables/nft ruleset' "$LR/network/firewall.txt" volatile sh -c '
+        command -v iptables >/dev/null 2>&1 && { echo "# iptables"; iptables -L -n -v 2>/dev/null; echo; }
+        command -v nft >/dev/null 2>&1 && { echo "# nftables"; nft list ruleset 2>/dev/null; }
+        true'
     run_step listening 'lsof -nP -iTCP -sTCP:LISTEN' "$LR/network/listening.txt" volatile sh -c 'command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP -sTCP:LISTEN || echo "lsof not available"'
+
+    # --- Sessions / accounts ---
+    run_step logins 'last -F -a' "$LR/system/last.txt" volatile sh -c 'last -F -a 2>/dev/null || last 2>/dev/null || true'
+    run_step failed_logins 'lastb -F -a' "$LR/system/lastb.txt" volatile sh -c 'lastb -F -a 2>/dev/null || echo "lastb unavailable (needs root / no btmp)"'
+    run_step who 'who -a' "$LR/system/who.txt" volatile sh -c 'who -a 2>/dev/null || who'
+    run_step uid0_accounts 'awk UID0 /etc/passwd' "$LR/system/uid0_accounts.txt" volatile awk -F: '$3==0{print $1}' /etc/passwd
+
+    # --- Persistence live views ---
+    run_step crontab_all 'crontab -l per user' "$LR/system/crontabs.txt" volatile sh -c '
+        for u in $(cut -d: -f1 /etc/passwd 2>/dev/null); do
+          c=$(crontab -l -u "$u" 2>/dev/null)
+          [ -n "$c" ] && printf "### %s\n%s\n\n" "$u" "$c"
+        done'
+    run_step journal_json 'journalctl -o json (recent)' "$LR/system/journal.json" volatile sh -c 'command -v journalctl >/dev/null 2>&1 && journalctl --no-pager -o json -n 20000 2>/dev/null || echo "{}"'
 
     if [ "$PROFILE" = full ]; then
         run_step modules 'lsmod' "$LR/system/lsmod.txt" volatile sh -c 'lsmod 2>/dev/null || cat /proc/modules'
-        run_step mounts 'mount' "$LR/system/mounts.txt" volatile sh -c 'mount; echo; cat /proc/mounts'
+        run_step mounts 'mount' "$LR/system/mounts.txt" volatile sh -c 'mount; echo; cat /proc/mounts 2>/dev/null'
         have systemctl && run_step services 'systemctl list-units' "$LR/system/services.txt" volatile systemctl list-units --type=service --no-pager
-        have journalctl && run_step journal 'journalctl -n 5000' "$LR/system/journal.txt" volatile journalctl --no-pager -n 5000
+        have systemctl && run_step timers 'systemctl list-timers' "$LR/system/timers.txt" volatile systemctl list-timers --all --no-pager
+        run_step packages 'dpkg -l / rpm -qa' "$LR/system/packages.txt" volatile sh -c 'command -v dpkg >/dev/null 2>&1 && dpkg -l 2>/dev/null || { command -v rpm >/dev/null 2>&1 && rpm -qa 2>/dev/null; } || echo "no dpkg/rpm"'
+        run_step open_files 'lsof -nP' "$LR/system/lsof.txt" volatile sh -c 'command -v lsof >/dev/null 2>&1 && lsof -nP 2>/dev/null || echo "lsof unavailable"'
+        run_step auditd_status 'auditctl -s/-l' "$LR/system/auditd.txt" volatile sh -c 'command -v auditctl >/dev/null 2>&1 && { auditctl -s 2>/dev/null; echo; auditctl -l 2>/dev/null; } || echo "auditctl unavailable"'
+        run_step containers 'docker ps -a' "$LR/system/containers.txt" volatile sh -c 'command -v docker >/dev/null 2>&1 && docker ps -a 2>/dev/null; [ -f /.dockerenv ] && echo "INSIDE CONTAINER (/.dockerenv present)"; true'
+        run_step staging_recent 'recent files /tmp /dev/shm /var/tmp' "$LR/system/staging_recent.txt" volatile sh -c 'find /tmp /dev/shm /var/tmp -type f -mtime -7 2>/dev/null | head -500'
     fi
 }
 

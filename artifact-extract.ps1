@@ -110,7 +110,7 @@ function Invoke-Step {
         [Parameter(Mandatory)][scriptblock]$Script
     )
     $parent = Split-Path -Parent $Target
-    if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $status = 'ok'; $message = $null; $exit = $null
@@ -131,9 +131,16 @@ function Invoke-Step {
     $sw.Stop()
 
     $bytes = 0L; $sha = $null
-    if (Test-Path $Target -PathType Leaf) {
-        $bytes = (Get-Item $Target).Length
-        if ($bytes -gt 0) { $sha = (Get-FileHash -Path $Target -Algorithm SHA256).Hash.ToLower() }
+    if (Test-Path -LiteralPath $Target -PathType Leaf) {
+        # -Force/-LiteralPath so hidden/system files (desktop.ini, NTUSER.*) and paths with
+        # wildcard chars are handled; hashing failures degrade the step, never abort the run.
+        try {
+            $bytes = (Get-Item -LiteralPath $Target -Force -ErrorAction Stop).Length
+            if ($bytes -gt 0) { $sha = (Get-FileHash -LiteralPath $Target -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower() }
+        }
+        catch {
+            if ($status -eq 'ok') { $status = 'degraded'; $message = "hash failed: $($_.Exception.Message)" }
+        }
     }
     elseif ($status -eq 'ok') {
         $status = 'degraded'; $message = 'no output produced'
@@ -148,6 +155,27 @@ function Invoke-Step {
 # ==================================================================================
 #  Collection modules
 # ==================================================================================
+
+# Copy one source file into the C\ tree, preserving its path (C:\x -> <root>\C\x).
+function Add-DiskFile {
+    param([Parameter(Mandatory)][string]$Source, [string]$Action = 'file_copy')
+    if ($Source -notmatch '^[A-Za-z]:\\') { return }
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { return }
+    $drive = $Source.Substring(0, 1).ToUpper()
+    $target = Join-Path $outRoot ($drive + $Source.Substring(2))
+    Invoke-Step -Action $Action -Category 'disk' -Command ("copy `"$Source`"") -Target $target `
+        -Script { Copy-Item -LiteralPath $Source -Destination $target -Force }
+}
+
+# Copy every file under a directory tree into the C\ tree.
+function Add-DiskTree {
+    param([Parameter(Mandatory)][string]$Root)
+    if (-not (Test-Path -LiteralPath $Root)) { return }
+    Get-ChildItem -LiteralPath $Root -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        Add-DiskFile -Source $_.FullName
+    }
+}
+
 function Collect-Disk {
     Write-Log "Collecting disk artifacts (C\ volume layout) [profile=$Profile]"
     $sys32 = Join-Path $outRoot 'C\Windows\System32'
@@ -171,7 +199,10 @@ function Collect-Disk {
             'Microsoft-Windows-TaskScheduler/Operational',
             'Microsoft-Windows-Windows Defender/Operational',
             'Microsoft-Windows-Bits-Client/Operational',
-            'Microsoft-Windows-Sysmon/Operational')
+            'Microsoft-Windows-Sysmon/Operational',
+            'Microsoft-Windows-Shell-Core/Operational',
+            'Microsoft-Windows-TerminalServices-RDPClient/Operational',
+            'Microsoft-Windows-SmbClient/Security')
     }
     foreach ($ch in $channels) {
         $fname = ($ch -replace '[\\/]', '%4') + '.evtx'
@@ -191,7 +222,32 @@ function Collect-Disk {
                 -Script { Copy-Item -LiteralPath $_.FullName -Destination $target -Force }
         }
     }
-    # NOTE: $MFT / USN / NTUSER.DAT (locked) deferred to Phase 4 (VSS/esentutl/raw-NTFS).
+    # Scheduled task definitions (persistence T1053)
+    Add-DiskTree -Root 'C:\Windows\System32\Tasks'
+    Add-DiskTree -Root 'C:\Windows\SysWOW64\Tasks'
+
+    # Standalone config / execution artifacts
+    Add-DiskFile -Source 'C:\Windows\System32\drivers\etc\hosts'
+    Add-DiskFile -Source 'C:\Windows\AppCompat\pca\PcaAppLaunchDic.txt'   # Win11 plaintext execution log
+    Add-DiskFile -Source 'C:\Windows\AppCompat\pca\PcaGeneralDb0.txt'
+
+    # All-users startup
+    Add-DiskTree -Root 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup'
+
+    # Per-user artifacts (non-locked): Recent (LNK + Jump Lists), Startup, PowerShell console history
+    Get-ChildItem 'C:\Users' -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        $u = $_.FullName
+        Add-DiskTree -Root (Join-Path $u 'AppData\Roaming\Microsoft\Windows\Recent')
+        Add-DiskTree -Root (Join-Path $u 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup')
+        Add-DiskFile -Source (Join-Path $u 'AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt')
+    }
+
+    # Windows Error Reporting (faulting-app paths; survives binary deletion) - larger, full only
+    if ($Profile -eq 'full') {
+        Add-DiskTree -Root 'C:\ProgramData\Microsoft\Windows\WER\ReportArchive'
+        Add-DiskTree -Root 'C:\ProgramData\Microsoft\Windows\WER\ReportQueue'
+    }
+    # NOTE: $MFT / USN / NTUSER.DAT / UsrClass.dat / Amcache / SRUM (locked) -> Wave 2 (VSS/esentutl).
 }
 
 function Collect-Volatile {
@@ -255,6 +311,50 @@ function Collect-Volatile {
             $global:LASTEXITCODE = 0
         }
 
+    # Autoruns-style registry triage (fast; complements the offline hives)
+    Invoke-Step -Action 'autoruns_registry' -Category 'volatile' -Command 'reg query Run/RunOnce/Winlogon/IFEO' `
+        -Target (Join-Path $v 'autoruns_registry.txt') `
+        -Script {
+            $o = Join-Path $v 'autoruns_registry.txt'
+            $keys = @(
+                'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+                'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
+                'HKLM\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Run',
+                'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon',
+                'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options',
+                'HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+                'HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce')
+            Set-Content -Path $o -Value '' -Encoding UTF8
+            foreach ($k in $keys) {
+                Add-Content -Path $o -Value "==== $k ====" -Encoding UTF8
+                (reg query $k /s 2>&1) | Out-File -FilePath $o -Append -Encoding UTF8
+            }
+            $global:LASTEXITCODE = 0
+        }
+
+    Invoke-Step -Action 'network_config' -Category 'volatile' -Command 'ipconfig /all; route print' `
+        -Target (Join-Path $v 'network_config.txt') `
+        -Script {
+            $o = Join-Path $v 'network_config.txt'
+            (ipconfig /all 2>&1) | Out-File -FilePath $o -Encoding UTF8
+            "`n==== route print ====" | Out-File -FilePath $o -Append -Encoding UTF8
+            (route print 2>&1) | Out-File -FilePath $o -Append -Encoding UTF8
+            $global:LASTEXITCODE = 0
+        }
+
+    Invoke-Step -Action 'smb' -Category 'volatile' -Command 'Get-SmbShare/Session; net use' `
+        -Target (Join-Path $v 'smb.txt') `
+        -Script {
+            $o = Join-Path $v 'smb.txt'
+            '==== SmbShare ===='   | Out-File -FilePath $o -Encoding UTF8
+            (Get-SmbShare -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String) | Out-File -FilePath $o -Append -Encoding UTF8
+            '==== SmbSession ===='  | Out-File -FilePath $o -Append -Encoding UTF8
+            (Get-SmbSession -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String) | Out-File -FilePath $o -Append -Encoding UTF8
+            '==== net use ===='    | Out-File -FilePath $o -Append -Encoding UTF8
+            (net use 2>&1) | Out-File -FilePath $o -Append -Encoding UTF8
+            $global:LASTEXITCODE = 0
+        }
+
     if ($Profile -eq 'full') {
         Invoke-Step -Action 'arp' -Category 'volatile' -Command 'arp -a' `
             -Target (Join-Path $v 'arp.txt') `
@@ -262,6 +362,22 @@ function Collect-Volatile {
         Invoke-Step -Action 'dns_cache' -Category 'volatile' -Command 'Get-DnsClientCache' `
             -Target (Join-Path $v 'dns_cache.csv') `
             -Script { Get-DnsClientCache -ErrorAction SilentlyContinue | Export-Csv -Path (Join-Path $v 'dns_cache.csv') -NoTypeInformation -Encoding UTF8 }
+        Invoke-Step -Action 'drivers' -Category 'volatile' -Command 'driverquery /v /fo csv' `
+            -Target (Join-Path $v 'drivers.csv') `
+            -Script { driverquery /v /fo csv 2>&1 | Out-File -FilePath (Join-Path $v 'drivers.csv') -Encoding UTF8; $global:LASTEXITCODE = 0 }
+        Invoke-Step -Action 'hotfixes' -Category 'volatile' -Command 'Get-HotFix' `
+            -Target (Join-Path $v 'hotfixes.csv') `
+            -Script { Get-HotFix -ErrorAction SilentlyContinue | Select-Object HotFixID, Description, InstalledOn, InstalledBy | Export-Csv -Path (Join-Path $v 'hotfixes.csv') -NoTypeInformation -Encoding UTF8 }
+        Invoke-Step -Action 'installed_software' -Category 'volatile' -Command 'reg Uninstall keys' `
+            -Target (Join-Path $v 'installed_software.csv') `
+            -Script {
+                $paths = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                    'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')
+                Get-ItemProperty $paths -ErrorAction SilentlyContinue |
+                    Where-Object DisplayName |
+                    Select-Object DisplayName, DisplayVersion, Publisher, InstallDate |
+                    Export-Csv -Path (Join-Path $v 'installed_software.csv') -NoTypeInformation -Encoding UTF8
+            }
     }
 }
 
