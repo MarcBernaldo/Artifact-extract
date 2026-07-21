@@ -302,6 +302,171 @@ function Copy-LockedEsentutl {
         -Target $target -Script { esentutl /y /vss $src /d $target 2>&1 | Out-Null }
 }
 
+# --- Raw NTFS metafile extraction ($MFT, $LogFile) ----------------------------------
+# NTFS metadata files cannot be copied with file APIs, not even out of a shadow copy.
+# The volume is opened raw, the boot sector gives the MFT location, and MFT record 0
+# describes where the $MFT itself lives on disk as a list of data runs.
+
+# Raw volume reads must be sector aligned, so read around the requested range and slice.
+function Read-RawBytes {
+    param($Vol, [long]$Offset, [int]$Count)
+    $sec = $Vol.BytesPerSector
+    $start = [long]([math]::Floor($Offset / $sec) * $sec)
+    $delta = [int]($Offset - $start)
+    $span = [int]([math]::Ceiling(($delta + $Count) / [double]$sec) * $sec)
+    $buf = New-Object byte[] $span
+    $Vol.Stream.Position = $start
+    $got = 0
+    while ($got -lt $span) {
+        $n = $Vol.Stream.Read($buf, $got, $span - $got)
+        if ($n -le 0) { break }
+        $got += $n
+    }
+    $out = New-Object byte[] $Count
+    $copy = [math]::Min($Count, [math]::Max(0, $got - $delta))
+    if ($copy -gt 0) { [Array]::Copy($buf, $delta, $out, 0, $copy) }
+    return $out
+}
+
+function Open-NtfsVolume {
+    param([string]$Drive = 'C')
+    $fs = New-Object System.IO.FileStream("\\.\${Drive}:", [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    $boot = New-Object byte[] 512
+    $null = $fs.Read($boot, 0, 512)
+    if ([System.Text.Encoding]::ASCII.GetString($boot, 3, 4) -ne 'NTFS') {
+        $fs.Dispose(); throw "volume ${Drive}: is not NTFS"
+    }
+    $bps = [BitConverter]::ToUInt16($boot, 0x0B)
+    $spc = [int]$boot[0x0D]
+    $cpr = [int][sbyte]$boot[0x40]
+    if ($cpr -lt 0) { $recSize = [int][math]::Pow(2, - $cpr) } else { $recSize = $cpr * $spc * $bps }
+    return @{
+        Stream = $fs; BytesPerSector = $bps; SectorsPerCluster = $spc
+        ClusterSize = ($bps * $spc); RecordSize = $recSize
+        MftOffset = ([BitConverter]::ToInt64($boot, 0x30) * $bps * $spc)
+    }
+}
+
+# Each sector of a record has its last two bytes stashed in the update sequence array.
+function Invoke-NtfsFixup {
+    param([byte[]]$Record, [int]$SectorSize)
+    $usaOff = [BitConverter]::ToUInt16($Record, 4)
+    $usaCnt = [BitConverter]::ToUInt16($Record, 6)
+    for ($i = 1; $i -lt $usaCnt; $i++) {
+        $end = ($i * $SectorSize) - 2
+        $src = $usaOff + ($i * 2)
+        if ($end + 1 -lt $Record.Length -and $src + 1 -lt $Record.Length) {
+            $Record[$end] = $Record[$src]; $Record[$end + 1] = $Record[$src + 1]
+        }
+    }
+    return $Record
+}
+
+# Decode the $DATA attribute's run list: each run is a relative cluster offset + length.
+function Get-NtfsDataRuns {
+    param([byte[]]$Record, [string]$StreamName = '')
+    $pos = [BitConverter]::ToUInt16($Record, 0x14)
+    while ($pos -ge 0 -and $pos -lt $Record.Length - 8) {
+        $type = [BitConverter]::ToUInt32($Record, $pos)
+        # [uint32]::MaxValue, not 0xFFFFFFFF: PowerShell reads that literal as Int32 -1,
+        # which never matches the UInt32 and would run the scan past the attribute list.
+        if ($type -eq [uint32]::MaxValue) { break }
+        $len = [int][BitConverter]::ToUInt32($Record, $pos + 4)
+        if ($len -le 0) { break }
+        if ($type -eq 0x80) {
+            $nameLen = [int]$Record[$pos + 9]
+            $name = ''
+            if ($nameLen -gt 0) {
+                $name = [System.Text.Encoding]::Unicode.GetString($Record, $pos + [BitConverter]::ToUInt16($Record, $pos + 10), $nameLen * 2)
+            }
+            if ($name -eq $StreamName -and $Record[$pos + 8] -eq 1) {
+                $p = $pos + [BitConverter]::ToUInt16($Record, $pos + 0x20)
+                $runs = @(); $lcn = 0L
+                while ($p -lt $Record.Length -and $Record[$p] -ne 0) {
+                    $h = $Record[$p]; $p++
+                    $lenSize = $h -band 0x0F
+                    $offSize = ($h -shr 4) -band 0x0F
+                    $count = 0L
+                    for ($i = 0; $i -lt $lenSize; $i++) { $count = $count -bor ([long]$Record[$p + $i] -shl (8 * $i)) }
+                    $p += $lenSize
+                    if ($offSize -eq 0) {
+                        $runs += , @{ Lcn = -1L; Clusters = $count }   # sparse
+                    }
+                    else {
+                        $rel = 0L
+                        for ($i = 0; $i -lt $offSize; $i++) { $rel = $rel -bor ([long]$Record[$p + $i] -shl (8 * $i)) }
+                        $signBit = 1L -shl ((8 * $offSize) - 1)
+                        if ($rel -band $signBit) { $rel = $rel - (1L -shl (8 * $offSize)) }
+                        $p += $offSize
+                        $lcn += $rel
+                        $runs += , @{ Lcn = $lcn; Clusters = $count }
+                    }
+                }
+                return @{ Runs = $runs; RealSize = [BitConverter]::ToInt64($Record, $pos + 0x30) }
+            }
+        }
+        $pos += $len
+    }
+    return $null
+}
+
+# Write an NTFS metafile (by MFT record number) out to disk, following its data runs.
+function Export-NtfsMetafile {
+    param($Vol, [int]$RecordNumber, [string]$StreamName, [string]$Target)
+    $rec = Read-RawBytes -Vol $Vol -Offset ($Vol.MftOffset + ([long]$RecordNumber * $Vol.RecordSize)) -Count $Vol.RecordSize
+    if ([System.Text.Encoding]::ASCII.GetString($rec, 0, 4) -ne 'FILE') { throw "MFT record $RecordNumber is not a FILE record" }
+    $rec = Invoke-NtfsFixup -Record $rec -SectorSize $Vol.BytesPerSector
+    $data = Get-NtfsDataRuns -Record $rec -StreamName $StreamName
+    if (-not $data) { throw "no non-resident data stream '$StreamName' in record $RecordNumber" }
+
+    $out = [System.IO.File]::Create($Target)
+    try {
+        $left = $data.RealSize
+        $zero = New-Object byte[] (1MB)
+        foreach ($run in $data.Runs) {
+            if ($left -le 0) { break }
+            $runBytes = [long]$run.Clusters * $Vol.ClusterSize
+            if ($run.Lcn -lt 0) {
+                while ($runBytes -gt 0 -and $left -gt 0) {
+                    $take = [int][math]::Min([math]::Min(1MB, $runBytes), $left)
+                    $out.Write($zero, 0, $take); $runBytes -= $take; $left -= $take
+                }
+            }
+            else {
+                $at = [long]$run.Lcn * $Vol.ClusterSize
+                while ($runBytes -gt 0 -and $left -gt 0) {
+                    $take = [int][math]::Min([math]::Min(4MB, $runBytes), $left)
+                    $buf = Read-RawBytes -Vol $Vol -Offset $at -Count $take
+                    $out.Write($buf, 0, $take)
+                    $at += $take; $runBytes -= $take; $left -= $take
+                }
+            }
+        }
+    }
+    finally { $out.Dispose() }
+}
+
+function Collect-RawNtfs {
+    $vol = $null
+    try { $vol = Open-NtfsVolume -Drive 'C' }
+    catch {
+        Write-Manifest -Action 'ntfs_raw' -Command 'open \\.\C:' -Target $null -Category 'disk' `
+            -ExitCode $null -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'degraded' -Message $_.Exception.Message
+        Write-Log "  raw NTFS unavailable: $($_.Exception.Message)" 'WARN'
+        return
+    }
+    try {
+        Write-Log ("  NTFS: {0}-byte clusters, {1}-byte MFT records" -f $vol.ClusterSize, $vol.RecordSize)
+        foreach ($m in @(@{ N = 0; F = '$MFT' }, @{ N = 2; F = '$LogFile' })) {
+            $target = Join-Path $outRoot ('C\' + $m.F)
+            Invoke-Step -Action 'ntfs_raw' -Category 'disk' -Command ("raw read {0} (MFT record {1})" -f $m.F, $m.N) `
+                -Target $target -Script { Export-NtfsMetafile -Vol $vol -RecordNumber $m.N -StreamName '' -Target $target }
+        }
+    }
+    finally { if ($vol -and $vol.Stream) { $vol.Stream.Dispose() } }
+}
+
 # --- Historical collection from EXISTING shadow copies (-Vss) -----------------------
 # Distinct from the snapshot above: that one is created now, purely to defeat file locks.
 # These are the restore points already on the volume, and they hold *previous* versions of
@@ -569,6 +734,18 @@ function Collect-Disk {
             finally { Remove-ShadowSnapshot $snap }
         }
     }
+    # --- Raw NTFS metafiles ($MFT, $LogFile) ---
+    if (-not $script:IsElevated) {
+        Write-Manifest -Action 'ntfs_raw' -Command 'n/a' -Target $null -Category 'disk' `
+            -ExitCode $null -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'skipped' `
+            -Message 'raw NTFS access ($MFT / $LogFile) requires elevation'
+        Write-Log '  $MFT / $LogFile skipped - run elevated' 'WARN'
+    }
+    else {
+        Write-Log 'Extracting NTFS metafiles ($MFT, $LogFile) by raw volume read...'
+        Collect-RawNtfs
+    }
+
     # --- Historical versions from existing shadow copies (-Vss) ---
     if ($Vss) {
         if (-not $script:IsElevated) {
@@ -582,7 +759,7 @@ function Collect-Disk {
             Collect-ShadowHistory
         }
     }
-    # NOTE: raw NTFS ($MFT / $UsnJrnl:$J / $LogFile) -> Wave 3 (raw-NTFS reader).
+    # NOTE: $UsnJrnl:$J still to come - it needs the $Extend index walked to find the record.
 }
 
 function Collect-Volatile {
