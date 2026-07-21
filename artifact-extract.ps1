@@ -265,6 +265,8 @@ function Add-ShadowFile {
     param($Snap, [string]$Rel)
     $src = $Snap.Root.TrimEnd('\') + '\' + $Rel
     if (-not [System.IO.File]::Exists($src)) { return }
+    # Never overwrite something already collected (e.g. a hive saved by reg save).
+    if (Test-Path -LiteralPath (Join-Path $outRoot (Join-Path 'C' $Rel))) { return }
     Copy-ShadowPath -Src $src -Rel $Rel
 }
 
@@ -527,12 +529,14 @@ function Collect-Disk {
             Write-Manifest -Action 'vss_snapshot' -Command 'Win32_ShadowCopy.Create' -Target $null -Category 'disk' `
                 -ExitCode 0 -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'ok' -Message $script:VssDiag
             try {
-                # Registry transaction logs (the hives themselves come from reg save above)
+                # Registry hives + their transaction logs. The hives are normally already
+                # present from reg save (and then skipped here); this is what saves the
+                # collection when reg.exe is blocked by security software.
                 foreach ($h in 'SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY', 'DEFAULT') {
+                    Add-ShadowFile $snap "Windows\System32\config\$h"
                     Add-ShadowFile $snap "Windows\System32\config\$h.LOG1"
                     Add-ShadowFile $snap "Windows\System32\config\$h.LOG2"
                 }
-                Add-ShadowFile $snap 'Windows\System32\config\DEFAULT'
                 # Execution artifacts (ESE / hive)
                 Add-ShadowFile $snap 'Windows\AppCompat\Programs\Amcache.hve'
                 Add-ShadowFile $snap 'Windows\AppCompat\Programs\Amcache.hve.LOG1'
