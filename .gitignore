@@ -1,9 +1,13 @@
 # Collection outputs (never commit collected data)
+result/
 *_windows_*/
 *_linux_*/
+*.zip
+*.tar.gz
 *.evtx
 *.raw
 *.ndjson
+*.sha256
 manifest.sha256
 
 # OS / editor cruft

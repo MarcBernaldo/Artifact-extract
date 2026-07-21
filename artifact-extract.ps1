@@ -16,7 +16,7 @@ param(
     [switch]$All,
     [ValidateSet('quick', 'full')]
     [string]$Profile = 'quick',
-    [string]$Output = '.',
+    [string]$Output = '',
     [switch]$KeepFolder,
     [switch]$Help
 )
@@ -34,10 +34,12 @@ Usage: .\artifact-extract.ps1 [-Disk] [-Volatile] [-Memory] [-All]
   (no flags)   disk only (C\ volume layout)   -Volatile   live captures
   -Disk        disk artifacts, explicit        -Memory     memory image (stub in v1)
   -All         disk + volatile + memory        -Profile    collection depth
-  -Output      destination root (default: .)   -KeepFolder keep the uncompressed folder
+  -Output      destination root               -KeepFolder keep the uncompressed folder
+               (default: <script dir>\result)
   -Help        this message
 
-Output is packed into <host>_windows_<UTC>.zip (+ .sha256) in the destination root.
+Output is packed into <host>_windows_<UTC>.zip (+ .sha256) in the destination root,
+which defaults to a 'result' folder next to this script.
 "@ | Write-Host
     return
 }
@@ -56,6 +58,12 @@ $principal         = New-Object Security.Principal.WindowsPrincipal($identity)
 $script:IsElevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 # --- Output layout ------------------------------------------------------------------
+# Default destination: a 'result' folder next to this script (not the current directory),
+# so the collection lands with the tool wherever it was copied to.
+if (-not $Output) {
+    $base = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+    $Output = Join-Path $base 'result'
+}
 $outRoot = [System.IO.Path]::GetFullPath((Join-Path $Output ("{0}_windows_{1}" -f $hostName, $stamp)))
 New-Item -ItemType Directory -Path $outRoot -Force | Out-Null
 
@@ -176,67 +184,106 @@ function Add-DiskTree {
     }
 }
 
-# --- Wave 2: locked-file acquisition via a single Volume Shadow Copy (elevated only) ---
+# --- Locked-file acquisition (elevated only) ----------------------------------------
+# Primary: one Volume Shadow Copy of C:, read every locked file out of it.
+# Fallbacks: per-file 'esentutl /y /vss', then 'reg save HKU\<SID>' for loaded user hives.
+$script:VssDiag = ''
 
-# Create a ClientAccessible shadow copy of C: and symlink it under %TEMP%.
-# Win32_ShadowCopy.Create works on Windows client (unlike 'vssadmin create shadow', Server-only).
-# Returns @{ Link; Wmi } or $null on failure.
+# Create a ClientAccessible shadow copy of C: and expose it as a usable path.
+# CIM is used deliberately: Get-WmiObject does not exist in PowerShell 7, so the WMI
+# variant silently failed there. Returns @{ Root; Link; Cim } or $null, reason in $script:VssDiag.
 function New-ShadowSnapshot {
+    $script:VssDiag = ''
     try {
-        $r = ([wmiclass]'root\cimv2:Win32_ShadowCopy').Create('C:\', 'ClientAccessible')
-        if ($r.ReturnValue -ne 0) { return $null }
-        $sc = Get-WmiObject Win32_ShadowCopy | Where-Object { $_.ID -eq $r.ShadowID }
-        if (-not $sc) { return $null }
+        $svc = Get-Service VSS -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -ne 'Running') { try { Start-Service VSS -ErrorAction Stop } catch { } }
+
+        $r = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create `
+            -Arguments @{ Volume = 'C:\'; Context = 'ClientAccessible' } -ErrorAction Stop
+        if ($null -eq $r) { $script:VssDiag = 'Create returned nothing'; return $null }
+        if ($r.ReturnValue -ne 0) {
+            $script:VssDiag = "Win32_ShadowCopy.Create ReturnValue=$($r.ReturnValue)"
+            return $null
+        }
+        $sc = Get-CimInstance Win32_ShadowCopy -ErrorAction Stop | Where-Object { $_.ID -eq $r.ShadowID }
+        if (-not $sc -or -not $sc.DeviceObject) {
+            $script:VssDiag = 'shadow copy created but DeviceObject missing'
+            return $null
+        }
+        $device = $sc.DeviceObject
+        # Preferred: symlink the device so ordinary path APIs work.
         $link = Join-Path $env:TEMP ('aeng_vss_' + [guid]::NewGuid().ToString('N'))
-        # Device path has no spaces; leave it unquoted so the trailing '\' is not read as an escape.
-        cmd /c mklink /d "$link" $($sc.DeviceObject)\ > $null 2>&1
-        if (-not (Test-Path -LiteralPath $link)) { try { $sc.Delete() } catch {}; return $null }
-        return @{ Link = $link; Wmi = $sc }
+        cmd /c mklink /d "$link" $device\ > $null 2>&1
+        if (Test-Path -LiteralPath $link) { return @{ Root = $link; Link = $link; Cim = $sc } }
+        # Fallback: address the device path directly (.NET handles \\?\GLOBALROOT paths).
+        $script:VssDiag = 'mklink failed; using raw device path'
+        return @{ Root = $device; Link = $null; Cim = $sc }
     }
-    catch { return $null }
+    catch {
+        $script:VssDiag = $_.Exception.Message
+        return $null
+    }
 }
 
 function Remove-ShadowSnapshot {
     param($Snap)
     if (-not $Snap) { return }
-    try { if (Test-Path -LiteralPath $Snap.Link) { cmd /c rmdir "$($Snap.Link)" > $null 2>&1 } } catch {}
-    try { $Snap.Wmi.Delete() } catch {}
+    try { if ($Snap.Link -and (Test-Path -LiteralPath $Snap.Link)) { cmd /c rmdir "$($Snap.Link)" > $null 2>&1 } } catch { }
+    try { if ($Snap.Cim) { Remove-CimInstance -InputObject $Snap.Cim -ErrorAction SilentlyContinue } } catch { }
 }
 
-# Copy one file (path relative to C:\) out of the shadow copy into the C\ tree.
-function Add-ShadowFile {
-    param($Snap, [string]$Rel)
-    $src = Join-Path $Snap.Link $Rel
-    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { return }
+# .NET file APIs throughout, so both the symlink and the raw device path work.
+function Copy-ShadowPath {
+    param([string]$Src, [string]$Rel)
     $target = Join-Path $outRoot (Join-Path 'C' $Rel)
     Invoke-Step -Action 'vss_copy' -Category 'disk' -Command "vss copy C:\$Rel" -Target $target `
-        -Script { Copy-Item -LiteralPath $src -Destination $target -Force }
+        -Script { [System.IO.File]::Copy($Src, $target, $true) }
 }
 
-# Copy files matching a wildcard pattern (relative to C:\) out of the shadow copy.
-function Add-ShadowGlob {
-    param($Snap, [string]$RelPattern)
-    Get-ChildItem -Path (Join-Path $Snap.Link $RelPattern) -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
-        $src = $_.FullName
-        $rel = $src.Substring($Snap.Link.Length).TrimStart('\')
-        $target = Join-Path $outRoot (Join-Path 'C' $rel)
-        Invoke-Step -Action 'vss_copy' -Category 'disk' -Command "vss copy $rel" -Target $target `
-            -Script { Copy-Item -LiteralPath $src -Destination $target -Force }
-    }
+function Add-ShadowFile {
+    param($Snap, [string]$Rel)
+    $src = $Snap.Root.TrimEnd('\') + '\' + $Rel
+    if (-not [System.IO.File]::Exists($src)) { return }
+    Copy-ShadowPath -Src $src -Rel $Rel
 }
 
-# Copy a whole directory tree out of the shadow copy (e.g. the WMI repository).
+function Get-ShadowFiles {
+    param([string]$Dir, [string]$Pattern = '*')
+    try { return @([System.IO.Directory]::EnumerateFiles($Dir, $Pattern, [System.IO.SearchOption]::AllDirectories)) }
+    catch { return @() }
+}
+
 function Add-ShadowTree {
-    param($Snap, [string]$RelRoot)
-    $root = Join-Path $Snap.Link $RelRoot
-    if (-not (Test-Path -LiteralPath $root)) { return }
-    Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
-        $src = $_.FullName
-        $rel = $src.Substring($Snap.Link.Length).TrimStart('\')
-        $target = Join-Path $outRoot (Join-Path 'C' $rel)
-        Invoke-Step -Action 'vss_copy' -Category 'disk' -Command "vss copy $rel" -Target $target `
-            -Script { Copy-Item -LiteralPath $src -Destination $target -Force }
+    param($Snap, [string]$RelRoot, [string]$Pattern = '*')
+    $base = $Snap.Root.TrimEnd('\')
+    foreach ($src in (Get-ShadowFiles -Dir ($base + '\' + $RelRoot) -Pattern $Pattern)) {
+        Copy-ShadowPath -Src $src -Rel $src.Substring($base.Length + 1)
     }
+}
+
+# Per-file native VSS copy - independent of the snapshot/symlink path above.
+function Copy-LockedEsentutl {
+    param([string]$Rel)
+    $src = 'C:\' + $Rel
+    if (-not [System.IO.File]::Exists($src)) { return }
+    $target = Join-Path $outRoot (Join-Path 'C' $Rel)
+    Invoke-Step -Action 'esentutl_copy' -Category 'disk' -Command "esentutl /y /vss `"$src`" /d `"$target`"" `
+        -Target $target -Script { esentutl /y /vss $src /d $target 2>&1 | Out-Null }
+}
+
+# Loaded user hives can be saved with no VSS at all.
+function Save-LoadedUserHives {
+    Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+        Where-Object { -not $_.Special -and $_.LocalPath -like 'C:\Users\*' } | ForEach-Object {
+            $sid = $_.SID
+            $name = Split-Path -Leaf $_.LocalPath
+            $t1 = Join-Path $outRoot "C\Users\$name\NTUSER.DAT"
+            Invoke-Step -Action 'registry_save' -Category 'disk' -Command "reg save HKU\$sid" -Target $t1 `
+                -Script { reg save "HKU\$sid" $t1 /y 2>&1 | Out-Null }
+            $t2 = Join-Path $outRoot "C\Users\$name\AppData\Local\Microsoft\Windows\UsrClass.dat"
+            Invoke-Step -Action 'registry_save' -Category 'disk' -Command "reg save HKU\${sid}_Classes" -Target $t2 `
+                -Script { reg save "HKU\${sid}_Classes" $t2 /y 2>&1 | Out-Null }
+        }
 }
 
 function Collect-Disk {
@@ -323,10 +370,23 @@ function Collect-Disk {
         if (-not $snap) {
             Write-Manifest -Action 'vss_snapshot' -Command 'Win32_ShadowCopy.Create' -Target $null -Category 'disk' `
                 -ExitCode $null -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'degraded' `
-                -Message 'could not create/mount a shadow copy'
-            Write-Log '  VSS snapshot unavailable - locked files skipped' 'WARN'
+                -Message "shadow copy unavailable: $script:VssDiag"
+            Write-Log "  VSS unavailable ($script:VssDiag) - falling back to esentutl / reg save" 'WARN'
+            # Fallback 1: per-file native VSS copy (manages its own snapshot internally).
+            foreach ($rel in @(
+                    'Windows\AppCompat\Programs\Amcache.hve',
+                    'Windows\System32\sru\SRUDB.dat',
+                    'Windows\System32\config\SYSTEM.LOG1', 'Windows\System32\config\SYSTEM.LOG2',
+                    'Windows\System32\config\SOFTWARE.LOG1', 'Windows\System32\config\SOFTWARE.LOG2',
+                    'Windows\System32\config\SAM.LOG1', 'Windows\System32\config\SECURITY.LOG1')) {
+                Copy-LockedEsentutl $rel
+            }
+            # Fallback 2: loaded user hives (NTUSER/UsrClass) need no VSS at all.
+            Save-LoadedUserHives
         }
         else {
+            Write-Manifest -Action 'vss_snapshot' -Command 'Win32_ShadowCopy.Create' -Target $null -Category 'disk' `
+                -ExitCode 0 -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'ok' -Message $script:VssDiag
             try {
                 # Registry transaction logs (the hives themselves come from reg save above)
                 foreach ($h in 'SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY', 'DEFAULT') {
@@ -350,7 +410,7 @@ function Collect-Disk {
                     Add-ShadowFile $snap "$rel\AppData\Local\Microsoft\Windows\UsrClass.dat.LOG2"
                     Add-ShadowFile $snap "$rel\AppData\Local\Google\Chrome\User Data\Default\History"
                     Add-ShadowFile $snap "$rel\AppData\Local\Microsoft\Edge\User Data\Default\History"
-                    Add-ShadowGlob $snap "$rel\AppData\Roaming\Mozilla\Firefox\Profiles\*\places.sqlite"
+                    Add-ShadowTree $snap "$rel\AppData\Roaming\Mozilla\Firefox\Profiles" 'places.sqlite'
                 }
                 # WMI repository (fileless persistence) - larger, full profile only
                 if ($Profile -eq 'full') { Add-ShadowTree $snap 'Windows\System32\wbem\Repository' }

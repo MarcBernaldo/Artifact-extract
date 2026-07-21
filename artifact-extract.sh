@@ -10,7 +10,7 @@
 COLLECTOR_VERSION='0.1.0'
 
 # --- Defaults / flag parsing (categories additive; default = disk only) -------------
-DISK=0; VOLATILE=0; MEMORY=0; PROFILE='quick'; OUTPUT='.'; KEEP_FOLDER=0
+DISK=0; VOLATILE=0; MEMORY=0; PROFILE='quick'; OUTPUT=''; KEEP_FOLDER=0
 
 usage() {
     cat <<EOF
@@ -22,10 +22,12 @@ Usage: sh artifact-extract.sh [--disk] [--volatile] [--memory] [--all]
   (no flags)     disk only ([root]/)          --volatile     live captures
   --disk         disk artifacts, explicit      --memory       memory image (stub in v1)
   --all          disk + volatile + memory      --profile      collection depth
-  --output       destination root (default .)  --keep-folder  keep uncompressed folder
+  --output       destination root              --keep-folder  keep uncompressed folder
+                 (default: <script dir>/result)
   --help         this message
 
-Output is packed into <host>_linux_<UTC>.tar.gz (+ .sha256) in the destination root.
+Output is packed into <host>_linux_<UTC>.tar.gz (+ .sha256) in the destination root,
+which defaults to a 'result' folder next to this script.
 EOF
 }
 
@@ -45,6 +47,15 @@ while [ $# -gt 0 ]; do
 done
 [ "$DISK" = 0 ] && [ "$VOLATILE" = 0 ] && [ "$MEMORY" = 0 ] && DISK=1
 case "$PROFILE" in quick|full) ;; *) echo "Invalid profile: $PROFILE" >&2; exit 2 ;; esac
+
+# Default destination: a 'result' folder next to this script (not the current directory),
+# so the collection lands with the tool wherever it was copied to.
+if [ -z "$OUTPUT" ]; then
+    SCRIPT_DIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd) || SCRIPT_DIR='.'
+    [ -z "$SCRIPT_DIR" ] && SCRIPT_DIR='.'
+    OUTPUT="$SCRIPT_DIR/result"
+fi
+mkdir -p "$OUTPUT" 2>/dev/null
 
 # --- Environment / clock ------------------------------------------------------------
 HOSTNAME_V=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo unknown)

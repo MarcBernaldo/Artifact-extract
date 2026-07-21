@@ -43,7 +43,7 @@ sh artifact-extract.sh --all --profile full --output /mnt/collections
 | `-Memory`      | `--memory`    | memory image *(stub in v1)*                    | `memory/`         |
 | `-All`         | `--all`       | disk + volatile + memory                      | all               |
 | `-Profile q\|f`| `--profile`   | collection depth: `quick` (default) or `full` | —                 |
-| `-Output <p>`  | `--output <p>`| destination root (default: current dir)       | —                 |
+| `-Output <p>`  | `--output <p>`| destination root (default: `result/` beside the script) | —       |
 | `-KeepFolder`  | `--keep-folder`| keep the uncompressed folder next to the archive | —              |
 
 Only the folders for selected categories are created.
@@ -51,7 +51,9 @@ Only the folders for selected categories are created.
 ### Final output — a single compressed file
 
 The collection folder is packed into one archive in the destination root and the working
-folder is removed (pass `-KeepFolder` / `--keep-folder` to retain it):
+folder is removed (pass `-KeepFolder` / `--keep-folder` to retain it). The destination root
+defaults to a **`result/` folder next to the script**, so the collection lands with the tool
+wherever it was copied to:
 
 - **Windows** → `<host>_windows_<UTC>.zip` (built with native `tar.exe`, fallback `Compress-Archive`)
 - **Linux** → `<host>_linux_<UTC>.tar.gz` (built with `tar czf`, fallback `tar | gzip` for busybox)
