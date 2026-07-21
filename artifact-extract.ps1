@@ -115,7 +115,10 @@ function Invoke-Step {
         [Parameter(Mandatory)][string]$Command,
         [Parameter(Mandatory)][string]$Target,
         [Parameter(Mandatory)][string]$Category,
-        [Parameter(Mandatory)][scriptblock]$Script
+        [Parameter(Mandatory)][scriptblock]$Script,
+        # Exit codes that are an expected condition rather than a failure (a fallback
+        # handles them), so they never inflate the error count.
+        [int[]]$BenignExitCodes = @()
     )
     $parent = Split-Path -Parent $Target
     if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
@@ -127,9 +130,14 @@ function Invoke-Step {
         & $Script | Out-Null
         if ($LASTEXITCODE -is [int]) { $exit = $LASTEXITCODE }
         if ($exit -and $exit -ne 0) {
-            # Without elevation, a privileged step failing is expected degradation, not an error.
-            $status = if ($script:IsElevated) { 'error' } else { 'degraded' }
-            $message = "exit code $exit"
+            if ($BenignExitCodes -contains $exit) {
+                $status = 'degraded'; $message = "exit code $exit (expected; handled by fallback)"
+            }
+            else {
+                # Without elevation, a privileged step failing is expected degradation, not an error.
+                $status = if ($script:IsElevated) { 'error' } else { 'degraded' }
+                $message = "exit code $exit"
+            }
         }
     }
     catch {
@@ -310,7 +318,8 @@ function Collect-Disk {
             $file = $_
             $channel = $file.BaseName -replace '%4', '/'
             $target = Join-Path $sys32 ('winevt\Logs\{0}' -f $file.Name)
-            Invoke-Step -Action 'eventlog_export' -Category 'disk' `
+            # 15007 = channel not registered (archived log); the copy below picks those up.
+            Invoke-Step -Action 'eventlog_export' -Category 'disk' -BenignExitCodes 15007 `
                 -Command ("wevtutil epl `"{0}`" `"{1}`"" -f $channel, $target) -Target $target `
                 -Script { wevtutil epl $channel $target 2>&1 | Out-Null }
             if (-not (Test-Path -LiteralPath $target)) {
