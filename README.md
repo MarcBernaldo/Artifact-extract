@@ -45,6 +45,7 @@ sh artifact-extract.sh --all --profile full --output /mnt/collections
 | `-Profile q\|f`| `--profile`   | collection depth: `quick` (default) or `full` | —                 |
 | `-Output <p>`  | `--output <p>`| destination root (default: `result/` beside the script) | —       |
 | `-KeepFolder`  | `--keep-folder`| keep the uncompressed folder next to the archive | —              |
+| `-Vss`         | *(Windows only)* | also collect the key forensic set from every existing shadow copy | `VSS1/`, `VSS2/`… |
 
 Only the folders for selected categories are created.
 
@@ -140,8 +141,13 @@ chain-of-custody verification after the fact.
 ## Scope & honest limitations
 
 - Locked files (Amcache, SRUM, NTUSER.DAT/UsrClass.dat, hive `.LOG1/.LOG2`, browser
-  history, WMI repository) — acquired on Windows via a single Volume Shadow Copy, **elevated
-  only**; without elevation they are marked `skipped` in the manifest.
+  history, WMI repository) — acquired on Windows via a single Volume Shadow Copy created for
+  the purpose, **elevated only**; they land in `C/` at their original paths, not in a separate
+  folder. Without elevation they are marked `skipped` in the manifest.
+- `-Vss` additionally collects **historical** versions of the key artifacts (hives +
+  transaction logs, Amcache, SRUM, NTUSER/UsrClass, event logs) from every shadow copy
+  already present on the volume, one `VSS<N>/` folder per snapshot. This is what recovers
+  artifacts an attacker altered or deleted; it can add a lot of data, so it is opt-in.
 - Raw NTFS (`$MFT`, `$UsnJrnl:$J`, `$LogFile`) — **deferred** (needs a raw-NTFS reader).
 - Memory acquisition — **stubbed**; no reliable native-only path, documented as such.
 - Several disk steps use LOLBin techniques (`reg save HKLM\SAM`, …) that some EDR/AV flag.

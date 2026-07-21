@@ -17,6 +17,7 @@ param(
     [ValidateSet('quick', 'full')]
     [string]$Profile = 'quick',
     [string]$Output = '',
+    [switch]$Vss,
     [switch]$KeepFolder,
     [switch]$Help
 )
@@ -29,13 +30,15 @@ if ($Help) {
 Artifact-extract $script:CollectorVersion - native DFIR collector (Windows)
 
 Usage: .\artifact-extract.ps1 [-Disk] [-Volatile] [-Memory] [-All]
-                              [-Profile quick|full] [-Output <path>] [-KeepFolder]
+                              [-Profile quick|full] [-Output <path>] [-Vss] [-KeepFolder]
 
   (no flags)   disk only (C\ volume layout)   -Volatile   live captures
   -Disk        disk artifacts, explicit        -Memory     memory image (stub in v1)
   -All         disk + volatile + memory        -Profile    collection depth
   -Output      destination root               -KeepFolder keep the uncompressed folder
                (default: <script dir>\result)
+  -Vss         also collect the key forensic set from every EXISTING shadow copy
+               (historical versions) into VSS1\, VSS2\... - can be large
   -Help        this message
 
 Output is packed into <host>_windows_<UTC>.zip (+ .sha256) in the destination root,
@@ -279,6 +282,104 @@ function Copy-LockedEsentutl {
         -Target $target -Script { esentutl /y /vss $src /d $target 2>&1 | Out-Null }
 }
 
+# --- Historical collection from EXISTING shadow copies (-Vss) -----------------------
+# Distinct from the snapshot above: that one is created now, purely to defeat file locks.
+# These are the restore points already on the volume, and they hold *previous* versions of
+# the same artifacts - often the only way to recover what an attacker altered or deleted.
+
+function Get-ExistingShadowCopies {
+    try {
+        $vol = Get-CimInstance Win32_Volume -Filter "DriveLetter='C:'" -ErrorAction Stop
+        if (-not $vol) { return @() }
+        return @(Get-CimInstance Win32_ShadowCopy -ErrorAction Stop |
+            Where-Object { $_.VolumeName -eq $vol.DeviceID } | Sort-Object InstallDate)
+    }
+    catch { return @() }
+}
+
+function Mount-ShadowDevice {
+    param([string]$Device)
+    $link = Join-Path $env:TEMP ('aeng_vss_' + [guid]::NewGuid().ToString('N'))
+    cmd /c mklink /d "$link" $Device\ > $null 2>&1
+    if (Test-Path -LiteralPath $link) { return $link }
+    return $null
+}
+
+function Dismount-ShadowDevice {
+    param([string]$Link)
+    try { if ($Link -and (Test-Path -LiteralPath $Link)) { cmd /c rmdir "$Link" > $null 2>&1 } } catch { }
+}
+
+function Get-ShadowDirs {
+    param([string]$Dir)
+    try { return @([System.IO.Directory]::EnumerateDirectories($Dir)) } catch { return @() }
+}
+
+# Copy out of a shadow copy into a VSS<N>\ folder (mirrors the volume root, KAPE-style).
+function Add-VssFile {
+    param([string]$Root, [string]$Prefix, [string]$Rel)
+    $src = $Root.TrimEnd('\') + '\' + $Rel
+    if (-not [System.IO.File]::Exists($src)) { return }
+    $target = Join-Path $outRoot (Join-Path $Prefix $Rel)
+    Invoke-Step -Action 'vss_historical' -Category 'disk' -Command "$Prefix copy $Rel" -Target $target `
+        -Script { [System.IO.File]::Copy($src, $target, $true) }
+}
+
+function Add-VssTree {
+    param([string]$Root, [string]$Prefix, [string]$RelRoot, [string]$Pattern = '*')
+    $base = $Root.TrimEnd('\')
+    foreach ($s in (Get-ShadowFiles -Dir ($base + '\' + $RelRoot) -Pattern $Pattern)) {
+        $src = $s
+        $target = Join-Path $outRoot (Join-Path $Prefix $src.Substring($base.Length + 1))
+        Invoke-Step -Action 'vss_historical' -Category 'disk' `
+            -Command "$Prefix copy $($src.Substring($base.Length + 1))" -Target $target `
+            -Script { [System.IO.File]::Copy($src, $target, $true) }
+    }
+}
+
+function Collect-ShadowHistory {
+    $shadows = Get-ExistingShadowCopies
+    if ($shadows.Count -eq 0) {
+        Write-Manifest -Action 'vss_history' -Command 'enumerate Win32_ShadowCopy' -Target $null -Category 'disk' `
+            -ExitCode $null -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'skipped' `
+            -Message 'no existing shadow copies on this volume (System Protection may be off)'
+        Write-Log '  no existing shadow copies found on C:' 'WARN'
+        return
+    }
+    Write-Log "  $($shadows.Count) existing shadow copy(ies) found - collecting historical artifacts"
+    $i = 0
+    foreach ($sc in $shadows) {
+        $i++
+        $prefix = "VSS$i"
+        $link = Mount-ShadowDevice $sc.DeviceObject
+        $root = if ($link) { $link } else { $sc.DeviceObject }
+        Write-Log ("  {0} <- {1} (created {2})" -f $prefix, $sc.ID, $sc.InstallDate)
+        Write-Manifest -Action 'vss_history' -Command "mount $($sc.ID)" -Target $null -Category 'disk' `
+            -ExitCode 0 -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'ok' `
+            -Message "$prefix = shadow copy $($sc.ID) created $($sc.InstallDate)"
+        try {
+            # Registry hives + their transaction logs
+            foreach ($h in 'SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY', 'DEFAULT') {
+                foreach ($ext in '', '.LOG1', '.LOG2') { Add-VssFile $root $prefix "Windows\System32\config\$h$ext" }
+            }
+            # Execution artifacts
+            foreach ($ext in '', '.LOG1', '.LOG2') { Add-VssFile $root $prefix "Windows\AppCompat\Programs\Amcache.hve$ext" }
+            Add-VssFile $root $prefix 'Windows\System32\sru\SRUDB.dat'
+            # Event logs (historical - recovers entries cleared from the live logs)
+            Add-VssTree $root $prefix 'Windows\System32\winevt\Logs' '*.evtx'
+            # Per-user hives
+            foreach ($ud in (Get-ShadowDirs ($root.TrimEnd('\') + '\Users'))) {
+                $uname = Split-Path -Leaf $ud
+                foreach ($ext in '', '.LOG1', '.LOG2') {
+                    Add-VssFile $root $prefix "Users\$uname\NTUSER.DAT$ext"
+                    Add-VssFile $root $prefix "Users\$uname\AppData\Local\Microsoft\Windows\UsrClass.dat$ext"
+                }
+            }
+        }
+        finally { Dismount-ShadowDevice $link }
+    }
+}
+
 # Loaded user hives can be saved with no VSS at all.
 function Save-LoadedUserHives {
     Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
@@ -430,6 +531,19 @@ function Collect-Disk {
                 if ($Profile -eq 'full') { Add-ShadowTree $snap 'Windows\System32\wbem\Repository' }
             }
             finally { Remove-ShadowSnapshot $snap }
+        }
+    }
+    # --- Historical versions from existing shadow copies (-Vss) ---
+    if ($Vss) {
+        if (-not $script:IsElevated) {
+            Write-Manifest -Action 'vss_history' -Command 'n/a' -Target $null -Category 'disk' `
+                -ExitCode $null -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'skipped' `
+                -Message 'historical shadow-copy collection requires elevation'
+            Write-Log '  -Vss requested but not elevated - skipped' 'WARN'
+        }
+        else {
+            Write-Log 'Collecting historical artifacts from existing shadow copies...'
+            Collect-ShadowHistory
         }
     }
     # NOTE: raw NTFS ($MFT / $UsnJrnl:$J / $LogFile) -> Wave 3 (raw-NTFS reader).
