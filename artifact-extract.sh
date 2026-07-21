@@ -349,7 +349,9 @@ cat > "$OUT_ROOT/metadata.json" <<EOF
   "utc_offset": "$UTC_OFFSET",
   "started_utc": "$START_UTC",
   "profile": "$PROFILE",
-  "categories": "$(echo "$SELECTED" | sed 's/^ //')"
+  "categories": "$(echo "$SELECTED" | sed 's/^ //')",
+  "keep_folder": $([ "$KEEP_FOLDER" = 1 ] && echo true || echo false),
+  "output_root": "$(json_escape "$OUTPUT")"
 }
 EOF
 

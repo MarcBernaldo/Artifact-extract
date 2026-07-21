@@ -762,6 +762,10 @@ $metadata = [ordered]@{
     started_local      = (Get-Date).ToString('o')
     profile            = $Profile
     categories         = $selected
+    # Record the options actually used, so a collection is self-describing after the fact.
+    vss_historical     = [bool]$Vss
+    keep_folder        = [bool]$KeepFolder
+    output_root        = $Output
 }
 [System.IO.File]::WriteAllText((Join-Path $outRoot 'metadata.json'),
     ($metadata | ConvertTo-Json -Depth 4), $script:Utf8NoBom)
