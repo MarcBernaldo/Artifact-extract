@@ -155,8 +155,16 @@ function Invoke-Step {
         }
     }
     catch {
-        $status = if ($script:IsElevated) { 'error' } else { 'degraded' }
-        $message = $_.Exception.Message
+        if ($LASTEXITCODE -is [int]) { $exit = $LASTEXITCODE }
+        if ($null -ne $exit -and $BenignExitCodes -contains $exit) {
+            # Windows PowerShell turns native stderr into a terminating error, so an
+            # expected failure arrives here rather than through the exit-code branch.
+            $status = 'degraded'; $message = "exit code $exit (expected; handled by fallback)"
+        }
+        else {
+            $status = if ($script:IsElevated) { 'error' } else { 'degraded' }
+            $message = $_.Exception.Message
+        }
     }
     $sw.Stop()
 
