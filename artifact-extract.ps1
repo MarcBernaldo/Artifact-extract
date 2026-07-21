@@ -60,6 +60,17 @@ $identity          = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal         = New-Object Security.Principal.WindowsPrincipal($identity)
 $script:IsElevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
+# Most of the collection shells out to built-in tools (reg, wevtutil, esentutl, tar).
+# A packaged/sandboxed host (e.g. the Microsoft Store build of PowerShell) blocks that,
+# which would silently reduce the collection to file copies only - so probe it up front.
+$script:CanRunNative = $false
+try {
+    & cmd.exe /c exit 0 2>&1 | Out-Null
+    $script:CanRunNative = ($LASTEXITCODE -eq 0)
+}
+catch { $script:CanRunNative = $false }
+$script:IsPackagedHost = ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName -like '*\WindowsApps\*')
+
 # --- Output layout ------------------------------------------------------------------
 # Default destination: a 'result' folder next to this script (not the current directory),
 # so the collection lands with the tool wherever it was copied to.
@@ -223,9 +234,8 @@ function New-ShadowSnapshot {
         }
         $device = $sc.DeviceObject
         # Preferred: symlink the device so ordinary path APIs work.
-        $link = Join-Path $env:TEMP ('aeng_vss_' + [guid]::NewGuid().ToString('N'))
-        cmd /c mklink /d "$link" $device\ > $null 2>&1
-        if (Test-Path -LiteralPath $link) { return @{ Root = $link; Link = $link; Cim = $sc } }
+        $link = Mount-ShadowDevice $device
+        if ($link) { return @{ Root = $link; Link = $link; Cim = $sc } }
         # Fallback: address the device path directly (.NET handles \\?\GLOBALROOT paths).
         $script:VssDiag = 'mklink failed; using raw device path'
         return @{ Root = $device; Link = $null; Cim = $sc }
@@ -239,7 +249,7 @@ function New-ShadowSnapshot {
 function Remove-ShadowSnapshot {
     param($Snap)
     if (-not $Snap) { return }
-    try { if ($Snap.Link -and (Test-Path -LiteralPath $Snap.Link)) { cmd /c rmdir "$($Snap.Link)" > $null 2>&1 } } catch { }
+    Dismount-ShadowDevice $Snap.Link
     try { if ($Snap.Cim) { Remove-CimInstance -InputObject $Snap.Cim -ErrorAction SilentlyContinue } } catch { }
 }
 
@@ -300,14 +310,27 @@ function Get-ExistingShadowCopies {
 function Mount-ShadowDevice {
     param([string]$Device)
     $link = Join-Path $env:TEMP ('aeng_vss_' + [guid]::NewGuid().ToString('N'))
-    cmd /c mklink /d "$link" $Device\ > $null 2>&1
-    if (Test-Path -LiteralPath $link) { return $link }
+    # New-Item first: pure PowerShell, no child process. mklink is the fallback for hosts
+    # where it does not accept a device target. Never let a failure here abort the run.
+    try {
+        New-Item -ItemType SymbolicLink -Path $link -Target ($Device + '\') -ErrorAction Stop | Out-Null
+        if (Test-Path -LiteralPath $link) { return $link }
+    }
+    catch { }
+    try {
+        cmd /c mklink /d "$link" $Device\ 2>&1 | Out-Null
+        if (Test-Path -LiteralPath $link) { return $link }
+    }
+    catch { }
     return $null
 }
 
 function Dismount-ShadowDevice {
     param([string]$Link)
-    try { if ($Link -and (Test-Path -LiteralPath $Link)) { cmd /c rmdir "$Link" > $null 2>&1 } } catch { }
+    if (-not $Link) { return }
+    # Remove only the link, never follow it into the snapshot.
+    try { [System.IO.Directory]::Delete($Link); return } catch { }
+    try { if (Test-Path -LiteralPath $Link) { cmd /c rmdir "$Link" 2>&1 | Out-Null } } catch { }
 }
 
 function Get-ShadowDirs {
@@ -347,6 +370,7 @@ function Collect-ShadowHistory {
         return
     }
     Write-Log "  $($shadows.Count) existing shadow copy(ies) found - collecting historical artifacts"
+    Write-Log "  (this repeats the key artifact set per snapshot; expect the collection to grow accordingly)"
     $i = 0
     foreach ($sc in $shadows) {
         $i++
@@ -741,6 +765,18 @@ Write-Log "Artifact-extract $script:CollectorVersion starting on $hostName"
 Write-Log "Elevated: $script:IsElevated | Profile: $Profile | Categories: $($selected -join ', ')"
 Write-Log "Output: $outRoot"
 if (-not $script:IsElevated) { Write-Log 'Not elevated - disk collection will be partial (steps marked degraded).' 'WARN' }
+if (-not $script:CanRunNative) {
+    Write-Log '****************************************************************' 'WARN'
+    Write-Log 'This PowerShell host cannot launch native executables.' 'WARN'
+    Write-Log 'reg / wevtutil / esentutl / tar will all fail, so registry hives,' 'WARN'
+    Write-Log 'event log exports and locked files CANNOT be collected.' 'WARN'
+    if ($script:IsPackagedHost) { Write-Log 'Cause: running from a packaged (Microsoft Store) PowerShell.' 'WARN' }
+    Write-Log 'Re-run from Windows PowerShell:  powershell.exe -File .\artifact-extract.ps1' 'WARN'
+    Write-Log '****************************************************************' 'WARN'
+    Write-Manifest -Action 'host_capability' -Command 'probe native execution' -Target $null -Category 'meta' `
+        -ExitCode $null -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'degraded' `
+        -Message 'host cannot launch native executables; hives/event logs/locked files unavailable'
+}
 
 # metadata.json
 $os = Get-CimInstance Win32_OperatingSystem
@@ -766,13 +802,26 @@ $metadata = [ordered]@{
     vss_historical     = [bool]$Vss
     keep_folder        = [bool]$KeepFolder
     output_root        = $Output
+    ps_version         = $PSVersionTable.PSVersion.ToString()
+    native_execution   = $script:CanRunNative
+    packaged_host      = $script:IsPackagedHost
 }
 [System.IO.File]::WriteAllText((Join-Path $outRoot 'metadata.json'),
     ($metadata | ConvertTo-Json -Depth 4), $script:Utf8NoBom)
 
-if ($Disk) { Collect-Disk }
-if ($Volatile) { Collect-Volatile }
-if ($Memory) { Collect-Memory }
+# A failure inside a module must never cost us the whole collection: whatever was gathered
+# still gets sealed and packed below.
+try {
+    if ($Disk) { Collect-Disk }
+    if ($Volatile) { Collect-Volatile }
+    if ($Memory) { Collect-Memory }
+}
+catch {
+    Write-Log "Collection stopped early: $($_.Exception.Message)" 'WARN'
+    Write-Manifest -Action 'collection_error' -Command 'n/a' -Target $null -Category 'meta' `
+        -ExitCode $null -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'error' `
+        -Message $_.Exception.Message
+}
 
 # Seal the manifest, then pack everything into a single archive.
 if (Test-Path $script:ManifestPath) {
