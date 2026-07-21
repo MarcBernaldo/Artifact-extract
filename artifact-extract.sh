@@ -175,16 +175,12 @@ collect_disk() {
     [ "$IS_ROOT" = 1 ] && { copy_artifact /etc/shadow; copy_artifact /etc/gshadow; }
     copy_tree /etc/sudoers.d 1
 
-    # --- Logs: auth, accounting, audit, package, syslog (incl. rotations) ---
-    for f in /var/log/auth.log* /var/log/secure* /var/log/syslog* /var/log/messages* \
-             /var/log/cron* /var/log/kern.log* /var/log/faillog /var/log/lastlog \
-             /var/log/wtmp* /var/log/btmp* /var/log/audit/audit.log* \
-             /var/log/dpkg.log* /var/log/yum.log* /var/log/dnf.log* \
-             /var/log/apt/history.log* /var/log/apt/term.log*; do
-        copy_artifact "$f"
-    done
-    # Web server logs (webshell / HTTP evidence)
-    for d in /var/log/apache2 /var/log/httpd /var/log/nginx; do copy_tree "$d" 3; done
+    # --- Logs: everything under /var/log, not a curated subset ---
+    # Covers auth/secure, audit, wtmp/btmp/lastlog, syslog/messages, cron, kernel, package
+    # managers and web servers, including rotated and compressed files. The binary journal
+    # is excluded here (large; exported as JSON in live_response, copied raw under --profile full).
+    find /var/log -maxdepth 8 -type f 2>/dev/null | grep -v '/var/log/journal/' \
+        | while IFS= read -r f; do copy_artifact "$f"; done
 
     # --- Persistence: cron, systemd, rc/init, PAM, ld.so, MOTD ---
     for d in /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly \

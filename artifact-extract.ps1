@@ -299,27 +299,32 @@ function Collect-Disk {
             -Script { reg save $h.Value $target /y 2>&1 | Out-Null }
     }
 
-    # Event logs (curated; full profile adds more channels)
-    $channels = @('Security', 'System', 'Application',
-        'Microsoft-Windows-PowerShell/Operational',
-        'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational',
-        'Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational')
-    if ($Profile -eq 'full') {
-        $channels += @('Microsoft-Windows-WMI-Activity/Operational',
-            'Microsoft-Windows-TaskScheduler/Operational',
-            'Microsoft-Windows-Windows Defender/Operational',
-            'Microsoft-Windows-Bits-Client/Operational',
-            'Microsoft-Windows-Sysmon/Operational',
-            'Microsoft-Windows-Shell-Core/Operational',
-            'Microsoft-Windows-TerminalServices-RDPClient/Operational',
-            'Microsoft-Windows-SmbClient/Security')
-    }
-    foreach ($ch in $channels) {
-        $fname = ($ch -replace '[\\/]', '%4') + '.evtx'
-        $target = Join-Path $sys32 ('winevt\Logs\{0}' -f $fname)
-        Invoke-Step -Action 'eventlog_export' -Category 'disk' `
-            -Command ("wevtutil epl `"{0}`" `"{1}`"" -f $ch, $target) -Target $target `
-            -Script { wevtutil epl $ch $target 2>&1 | Out-Null }
+    # Event logs - EVERY channel present on the system, not a curated subset.
+    # Enumerating the .evtx files on disk (rather than 'wevtutil el') keeps us to the
+    # channels that actually have a log, and the filename maps back to the channel name
+    # ('%4' is the escaped '/'). wevtutil handles the live lock; archived or unregistered
+    # logs cannot be exported by channel name, so those fall back to a direct file copy.
+    $logDir = 'C:\Windows\System32\winevt\Logs'
+    if (Test-Path -LiteralPath $logDir) {
+        Get-ChildItem -LiteralPath $logDir -Filter '*.evtx' -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            $file = $_
+            $channel = $file.BaseName -replace '%4', '/'
+            $target = Join-Path $sys32 ('winevt\Logs\{0}' -f $file.Name)
+            Invoke-Step -Action 'eventlog_export' -Category 'disk' `
+                -Command ("wevtutil epl `"{0}`" `"{1}`"" -f $channel, $target) -Target $target `
+                -Script { wevtutil epl $channel $target 2>&1 | Out-Null }
+            if (-not (Test-Path -LiteralPath $target)) {
+                # Only worth copying if the file is actually readable (archived/unregistered
+                # channels). If the export failed on permissions, a copy fails the same way.
+                $readable = $false
+                try {
+                    $fs = [System.IO.File]::Open($file.FullName, 'Open', 'Read', 'ReadWrite')
+                    $fs.Close(); $readable = $true
+                }
+                catch { }
+                if ($readable) { Add-DiskFile -Source $file.FullName -Action 'eventlog_copy' }
+            }
+        }
     }
 
     # Prefetch (readable copies; requires admin to enumerate)
