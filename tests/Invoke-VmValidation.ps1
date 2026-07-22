@@ -6,13 +6,10 @@
     exercised from an ordinary session. This drives a disposable guest instead: push
     the script in, run it, pull the collection out, roll the guest back.
 
-    Guest credentials come from a credential file you create once. The password is
-    stored with DPAPI, so the file only decrypts under your account on this machine,
-    and it is never typed into a command, a script, or a transcript:
-
-        $u = Read-Host 'guest user'
-        $p = Read-Host 'guest password' -AsSecureString
-        Set-Content "$env:USERPROFILE\.artifact-extract-vm.cred" @($u, (ConvertFrom-SecureString $p))
+    Guest credentials come from a per-VM credential file, created once with
+    Set-VmCredential.ps1. The password is stored with DPAPI, so the file only
+    decrypts under your account on this machine, and it is never typed into a
+    command, a script, or a transcript.
 
     One honest caveat: vmrun only accepts a plaintext password as an argument, so it
     is decrypted in memory and appears in this host's process list while a guest
@@ -30,7 +27,9 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$Vmx,
-    [string]$CredentialFile = (Join-Path $env:USERPROFILE '.artifact-extract-vm.cred'),
+    # Defaults to the per-VM file written by Set-VmCredential.ps1; guests rarely
+    # share an account, so each one carries its own.
+    [string]$CredentialFile,
     [ValidateSet('probe', 'collect')][string]$Mode = 'probe',
     [string]$CollectorArgs = '',
     [string]$ResultDir,
@@ -43,8 +42,12 @@ param(
 $ErrorActionPreference = 'Stop'
 
 if (-not (Test-Path -LiteralPath $Vmx)) { throw "VM not found: $Vmx" }
+if (-not $CredentialFile) {
+    $CredentialFile = Join-Path $env:USERPROFILE ('.artifact-extract-vm\{0}.cred' -f `
+        ([System.IO.Path]::GetFileNameWithoutExtension($Vmx)))
+}
 if (-not (Test-Path -LiteralPath $CredentialFile)) {
-    throw "No credential file at $CredentialFile - create it as shown in the header of this script."
+    throw "No credential file at $CredentialFile - create it with: .\tests\Set-VmCredential.ps1 -Vmx '$Vmx'"
 }
 $credLines = @(Get-Content -LiteralPath $CredentialFile | Where-Object { $_ })
 if ($credLines.Count -lt 2) { throw "$CredentialFile should hold the user on line 1 and the protected password on line 2." }
