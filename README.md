@@ -152,6 +152,20 @@ It covers the boot-sector geometry, the update sequence array, fragmented and sp
 runs, negative relative cluster offsets, the trailing partial cluster, and the 64-bit
 bounds a multi-gigabyte `$MFT` depends on.
 
+The privileged paths — shadow copy creation, raw volume reads, hive export — cannot be
+exercised from an ordinary session, so they are validated against a disposable VMware
+guest instead. [`tests/Invoke-VmValidation.ps1`](tests/Invoke-VmValidation.ps1) snapshots
+the guest, pushes the collector in, runs it, retrieves the archive, and rolls the guest
+back:
+
+```powershell
+.\tests\Invoke-VmValidation.ps1 -Vmx 'E:\VM\Lab\Lab.vmx' -Mode probe
+.\tests\Invoke-VmValidation.ps1 -Vmx 'E:\VM\Lab\Lab.vmx' -Mode collect -CollectorArgs '-Vss' -Revert
+```
+
+`-Mode probe` reports what the guest actually grants — token elevation, raw volume access,
+shadow copy service state — before any collection is attempted.
+
 ## Scope & honest limitations
 
 - Locked files (Amcache, SRUM, NTUSER.DAT/UsrClass.dat, hive `.LOG1/.LOG2`, browser

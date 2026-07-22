@@ -1,5 +1,6 @@
 # Collection outputs (never commit collected data)
 result/
+result-vm/
 *_windows_*/
 *_linux_*/
 *.zip
