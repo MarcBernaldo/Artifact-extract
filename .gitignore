@@ -1,6 +1,13 @@
+# Guest credentials - the store lives outside the repo, these are belt and braces
+*.cred
+.artifact-extract-vm/
+
 # Collection outputs (never commit collected data)
 result/
 result-vm/
+probe.json
+produced.txt
+run.log
 *_windows_*/
 *_linux_*/
 *.zip
