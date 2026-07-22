@@ -727,8 +727,8 @@ function Collect-Disk {
     Add-DiskTree -Root 'C:\ProgramData\Microsoft\Windows Defender\Scans\History\Service'
     Add-DiskTree -Root 'C:\Windows\System32\LogFiles\Firewall'
 
-    # Background transfer queue (download persistence) and registry backups
-    Add-DiskTree -Root 'C:\ProgramData\Microsoft\Network\Downloader' -Filter 'qmgr*.db'
+    # Registry backups. The background transfer queue lives next door but is held open
+    # by its service, so it is acquired from the shadow copy instead.
     Add-DiskTree -Root 'C:\Windows\System32\config\RegBack'
 
     # All-users startup
@@ -804,6 +804,8 @@ function Collect-Disk {
                 Add-ShadowFile $snap 'Windows\AppCompat\Programs\Amcache.hve.LOG1'
                 Add-ShadowFile $snap 'Windows\AppCompat\Programs\Amcache.hve.LOG2'
                 Add-ShadowFile $snap 'Windows\System32\sru\SRUDB.dat'
+                # Background transfer queue - held open by the BITS service
+                Add-ShadowTree $snap 'ProgramData\Microsoft\Network\Downloader' 'qmgr*.db'
                 # Per-user hives (UserAssist / MRU / Shellbags) + browser history
                 Get-ChildItem 'C:\Users' -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
                     $rel = "Users\$($_.Name)"
@@ -904,7 +906,10 @@ function Collect-Volatile {
     Invoke-Step -Action 'sessions' -Category 'volatile' -Command 'query user' `
         -Target (Join-Path $v 'sessions.txt') `
         -Script {
-            # 'query user' exits 1 when no interactive sessions exist - not a failure.
+            # No interactive session is a normal state, but the tool reports it on
+            # stderr, which Windows PowerShell turns into a terminating error under
+            # this script's Stop preference - so it is relaxed for the call itself.
+            $ErrorActionPreference = 'Continue'
             (query user 2>&1) | Out-File -FilePath (Join-Path $v 'sessions.txt') -Encoding UTF8
             $global:LASTEXITCODE = 0
         }
@@ -913,6 +918,9 @@ function Collect-Volatile {
     Invoke-Step -Action 'autoruns_registry' -Category 'volatile' -Command 'reg query Run/RunOnce/Winlogon/IFEO' `
         -Target (Join-Path $v 'autoruns_registry.txt') `
         -Script {
+            # A key that does not exist is a finding, not an error, but reg.exe says so
+            # on stderr - same terminating-error problem as the session query above.
+            $ErrorActionPreference = 'Continue'
             $o = Join-Path $v 'autoruns_registry.txt'
             $keys = @(
                 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
