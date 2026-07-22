@@ -71,6 +71,10 @@ $vmName = [System.IO.Path]::GetFileNameWithoutExtension($Vmx)
 if (-not $ResultDir) { $ResultDir = Join-Path $repo ('result-vm\' + $vmName) }
 $BASELINE = 'artifact-extract-baseline'
 $GUEST_DIR = 'C:\artifact-extract'
+$GUEST_PS = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+# No -interactive on runProgramInGuest: it requires a logged-in desktop session,
+# which a headless guest does not have. Without it the guest agent still starts the
+# process with a full administrator token, which is what the collector needs.
 
 function Say { param([string]$m, [string]$c = 'Gray') Write-Host ("  {0}" -f $m) -ForegroundColor $c }
 
@@ -121,13 +125,15 @@ Vm 'createDirectoryInGuest' @($GUEST_DIR) -Guest -Tolerate | Out-Null
 # --- Privilege probe --------------------------------------------------------------
 # Whether the guest agent hands the process a full or a filtered token decides
 # whether any of the privileged collection paths can be tested at all, so it is
-# measured rather than assumed.
+# measured rather than assumed. Free space is reported too: a guest that runs out
+# midway produces a truncated archive that looks like a collector failure.
 $probePs = @'
 $o = [ordered]@{
   user       = "$env:USERDOMAIN\$env:USERNAME"
   ps_version = $PSVersionTable.PSVersion.ToString()
   os         = (Get-CimInstance Win32_OperatingSystem).Caption
   elevated   = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  integrity  = ((whoami /groups | Select-String 'Mandatory Label') -split '\s{2,}')[0]
   can_read_raw_volume = $false
   vss_service = (Get-Service VSS -ErrorAction SilentlyContinue).Status.ToString()
   free_gb    = [math]::Round((Get-PSDrive C).Free/1GB,1)
@@ -138,8 +144,7 @@ $o | ConvertTo-Json | Set-Content -Path 'C:\artifact-extract\probe.json' -Encodi
 $probeLocal = Join-Path $env:TEMP 'ae-probe.ps1'
 Set-Content -LiteralPath $probeLocal -Value $probePs -Encoding UTF8
 Vm 'CopyFileFromHostToGuest' @($probeLocal, "$GUEST_DIR\probe.ps1") -Guest | Out-Null
-Vm 'runProgramInGuest' @('-interactive', 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
-    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$GUEST_DIR\probe.ps1") -Guest -Tolerate | Out-Null
+Vm 'runProgramInGuest' @($GUEST_PS, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$GUEST_DIR\probe.ps1") -Guest | Out-Null
 
 New-Item -ItemType Directory -Path $ResultDir -Force | Out-Null
 $probeOut = Join-Path $ResultDir 'probe.json'
@@ -170,8 +175,9 @@ $runner = "& '$GUEST_DIR\artifact-extract.ps1' $CollectorArgs *> '$GUEST_DIR\run
 $runnerLocal = Join-Path $env:TEMP 'ae-runner.ps1'
 Set-Content -LiteralPath $runnerLocal -Value $runner -Encoding UTF8
 Vm 'CopyFileFromHostToGuest' @($runnerLocal, "$GUEST_DIR\run.ps1") -Guest | Out-Null
-Vm 'runProgramInGuest' @('-interactive', 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
-    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$GUEST_DIR\run.ps1") -Guest -Tolerate | Out-Null
+# Tolerated: a collection that degrades still exits non-zero but has produced an
+# archive worth retrieving, and run.log below explains what happened.
+Vm 'runProgramInGuest' @($GUEST_PS, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$GUEST_DIR\run.ps1") -Guest -Tolerate | Out-Null
 $sw.Stop()
 Say ("collector finished in {0:N0}s" -f $sw.Elapsed.TotalSeconds) 'Green'
 
@@ -187,8 +193,7 @@ Get-ChildItem 'C:\artifact-extract\result' -File |
   Set-Content 'C:\artifact-extract\produced.txt' -Encoding UTF8
 '@
 Vm 'CopyFileFromHostToGuest' @($listLocal, "$GUEST_DIR\list.ps1") -Guest | Out-Null
-Vm 'runProgramInGuest' @('-interactive', 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
-    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$GUEST_DIR\list.ps1") -Guest -Tolerate | Out-Null
+Vm 'runProgramInGuest' @($GUEST_PS, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$GUEST_DIR\list.ps1") -Guest -Tolerate | Out-Null
 $producedList = Join-Path $ResultDir 'produced.txt'
 Vm 'CopyFileFromGuestToHost' @("$GUEST_DIR\produced.txt", $producedList) -Guest -Tolerate | Out-Null
 
