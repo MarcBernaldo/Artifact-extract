@@ -824,8 +824,13 @@ function Collect-Disk {
                     Add-ShadowFile $snap "$rel\AppData\Local\Microsoft\Windows\WebCache\WebCacheV01.dat"
                     Add-ShadowTree $snap "$rel\AppData\Local\ConnectedDevicesPlatform" 'ActivitiesCache.db'
                 }
-                # WMI repository (fileless persistence) - larger, full profile only
-                if ($Profile -eq 'full') { Add-ShadowTree $snap 'Windows\System32\wbem\Repository' }
+                # Larger stores, full profile only: the WMI repository (fileless
+                # persistence) and the search index, which retains metadata for files
+                # that no longer exist on disk.
+                if ($Profile -eq 'full') {
+                    Add-ShadowTree $snap 'Windows\System32\wbem\Repository'
+                    Add-ShadowTree $snap 'ProgramData\Microsoft\Search\Data\Applications\Windows' 'Windows.edb'
+                }
                 # --- Raw NTFS metafiles ($MFT, $LogFile), read from the same snapshot ---
                 Write-Log 'Extracting NTFS metafiles ($MFT, $LogFile) by raw volume read...'
                 Collect-RawNtfs -Device $snap.Cim.DeviceObject
