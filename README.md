@@ -10,9 +10,9 @@ original paths, so the collection can be ingested by
 [Artifact Engine](https://github.com/MarcBernaldo/Artifact-Engine) without modification.
 
 > Status: **triage collector**. Locked files (registry hives + transaction logs, Amcache,
-> SRUM, NTUSER/UsrClass, browser history, WMI repository) are acquired on Windows via a
-> Volume Shadow Copy when elevated. Raw NTFS (`$MFT`, `$UsnJrnl`, `$LogFile`) and memory
-> acquisition remain out of scope.
+> SRUM, NTUSER/UsrClass, browser history, timeline, WMI repository) and the NTFS metafiles
+> (`$MFT`, `$LogFile`) are acquired on Windows from a Volume Shadow Copy when elevated.
+> `$UsnJrnl:$J` and memory acquisition remain out of scope.
 
 ## Usage
 
@@ -138,6 +138,20 @@ chain-of-custody verification after the fact.
 > Regenerate `SHA256SUMS` whenever a script changes — a stale hash will fail verification and
 > will not match an allowlist entry.
 
+## Tests
+
+The raw NTFS reader is the one component that cannot be checked by reading its output, so
+it has a regression test that runs against a synthetic volume image — no elevation, no
+disk required:
+
+```powershell
+powershell -File tests\Test-NtfsReader.ps1
+```
+
+It covers the boot-sector geometry, the update sequence array, fragmented and sparse data
+runs, negative relative cluster offsets, the trailing partial cluster, and the 64-bit
+bounds a multi-gigabyte `$MFT` depends on.
+
 ## Scope & honest limitations
 
 - Locked files (Amcache, SRUM, NTUSER.DAT/UsrClass.dat, hive `.LOG1/.LOG2`, browser
@@ -148,7 +162,14 @@ chain-of-custody verification after the fact.
   transaction logs, Amcache, SRUM, NTUSER/UsrClass, event logs) from every shadow copy
   already present on the volume, one `VSS<N>/` folder per snapshot. This is what recovers
   artifacts an attacker altered or deleted; it can add a lot of data, so it is opt-in.
-- Raw NTFS (`$MFT`, `$UsnJrnl:$J`, `$LogFile`) — **deferred** (needs a raw-NTFS reader).
+- `$MFT` and `$LogFile` — extracted by reading the volume raw and following the metafile's
+  own data runs, **elevated only**. The read is taken from the same shadow copy as the
+  locked files above, so the metafiles are consistent with the rest of the collection and
+  nothing shifts underneath a multi-gigabyte read. An extraction that the base MFT record
+  cannot fully describe is reported as incomplete rather than written out short.
+- `$UsnJrnl:$J` — **deferred** (sparse-file handling).
+- The `$I` index entries in `$Recycle.Bin` are collected (original path, size, delete
+  time); the `$R` payloads — the deleted content itself — are not.
 - Memory acquisition — **stubbed**; no reliable native-only path, documented as such.
 - Several disk steps use LOLBin techniques (`reg save HKLM\SAM`, …) that some EDR/AV flag.
   In authorized DFIR this is expected; failing steps are logged and never abort the run.

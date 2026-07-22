@@ -194,22 +194,42 @@ function Invoke-Step {
 #  Collection modules
 # ==================================================================================
 
+# Probe a built-in tool once. Security software commonly blocks these specific binaries,
+# and finding that out up front avoids hundreds of identical failures in the manifest.
+function Test-BuiltinTool {
+    param([string]$Exe, [string[]]$ProbeArgs, [string]$Purpose)
+    try {
+        $global:LASTEXITCODE = 0
+        & $Exe @ProbeArgs 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { return $true }
+    }
+    catch { }
+    Write-Log "  $Exe cannot be run here - $Purpose" 'WARN'
+    Write-Manifest -Action 'tool_unavailable' -Command "$Exe $($ProbeArgs -join ' ')" -Target $null `
+        -Category 'meta' -ExitCode $null -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'degraded' `
+        -Message "$Exe could not be launched (blocked by security software?); $Purpose"
+    return $false
+}
+
 # Copy one source file into the C\ tree, preserving its path (C:\x -> <root>\C\x).
 function Add-DiskFile {
     param([Parameter(Mandatory)][string]$Source, [string]$Action = 'file_copy')
     if ($Source -notmatch '^[A-Za-z]:\\') { return }
-    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { return }
+    # Some artifact paths are ACL'd to SYSTEM alone, where Test-Path itself errors out;
+    # under the script's Stop preference that would abort the module, not skip the path.
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf -ErrorAction SilentlyContinue)) { return }
     $drive = $Source.Substring(0, 1).ToUpper()
     $target = Join-Path $outRoot ($drive + $Source.Substring(2))
     Invoke-Step -Action $Action -Category 'disk' -Command ("copy `"$Source`"") -Target $target `
         -Script { Copy-Item -LiteralPath $Source -Destination $target -Force }
 }
 
-# Copy every file under a directory tree into the C\ tree.
+# Copy every file under a directory tree into the C\ tree. A filter keeps the collection
+# to the artifact itself where the surrounding tree is large (deleted-file indexes, logs).
 function Add-DiskTree {
-    param([Parameter(Mandatory)][string]$Root)
-    if (-not (Test-Path -LiteralPath $Root)) { return }
-    Get-ChildItem -LiteralPath $Root -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
+    param([Parameter(Mandatory)][string]$Root, [string]$Filter = '*')
+    if (-not (Test-Path -LiteralPath $Root -ErrorAction SilentlyContinue)) { return }
+    Get-ChildItem -LiteralPath $Root -Filter $Filter -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
         Add-DiskFile -Source $_.FullName
     }
 }
@@ -329,17 +349,20 @@ function Read-RawBytes {
 }
 
 function Open-NtfsVolume {
-    param([string]$Drive = 'C')
-    $fs = New-Object System.IO.FileStream("\\.\${Drive}:", [System.IO.FileMode]::Open,
+    param([string]$Path = '\\.\C:')
+    $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open,
         [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
     $boot = New-Object byte[] 512
     $null = $fs.Read($boot, 0, 512)
     if ([System.Text.Encoding]::ASCII.GetString($boot, 3, 4) -ne 'NTFS') {
-        $fs.Dispose(); throw "volume ${Drive}: is not NTFS"
+        $fs.Dispose(); throw "$Path is not an NTFS volume"
     }
     $bps = [BitConverter]::ToUInt16($boot, 0x0B)
     $spc = [int]$boot[0x0D]
-    $cpr = [int][sbyte]$boot[0x40]
+    # Clusters per MFT record is a signed byte; reinterpret the bits rather than casting
+    # (PowerShell converts the value, so [sbyte]246 throws instead of yielding -10).
+    $cpr = [int]$boot[0x40]
+    if ($cpr -gt 127) { $cpr = $cpr - 256 }
     if ($cpr -lt 0) { $recSize = [int][math]::Pow(2, - $cpr) } else { $recSize = $cpr * $spc * $bps }
     return @{
         Stream = $fs; BytesPerSector = $bps; SectorsPerCluster = $spc
@@ -420,44 +443,70 @@ function Export-NtfsMetafile {
     $data = Get-NtfsDataRuns -Record $rec -StreamName $StreamName
     if (-not $data) { throw "no non-resident data stream '$StreamName' in record $RecordNumber" }
 
+    # Every bound below is [long]: the $MFT runs to several GB, and mixing an Int32
+    # literal into [math]::Min() makes PowerShell pick the Int32 overload and overflow.
+    $chunkMax = [long]8MB
     $out = [System.IO.File]::Create($Target)
     try {
-        $left = $data.RealSize
-        $zero = New-Object byte[] (1MB)
+        $left = [long]$data.RealSize
+        $buf = New-Object byte[] $chunkMax
         foreach ($run in $data.Runs) {
             if ($left -le 0) { break }
             $runBytes = [long]$run.Clusters * $Vol.ClusterSize
             if ($run.Lcn -lt 0) {
+                # Sparse run: the file occupies the range but no clusters are allocated.
+                [Array]::Clear($buf, 0, $buf.Length)
                 while ($runBytes -gt 0 -and $left -gt 0) {
-                    $take = [int][math]::Min([math]::Min(1MB, $runBytes), $left)
-                    $out.Write($zero, 0, $take); $runBytes -= $take; $left -= $take
+                    $take = [int][math]::Min([math]::Min($chunkMax, $runBytes), $left)
+                    $out.Write($buf, 0, $take); $runBytes -= $take; $left -= $take
                 }
             }
             else {
-                $at = [long]$run.Lcn * $Vol.ClusterSize
+                # Read sequentially through the run: raw device reads must stay sector
+                # aligned, and both the run length and the chunk are cluster multiples.
+                $Vol.Stream.Position = [long]$run.Lcn * $Vol.ClusterSize
                 while ($runBytes -gt 0 -and $left -gt 0) {
-                    $take = [int][math]::Min([math]::Min(4MB, $runBytes), $left)
-                    $buf = Read-RawBytes -Vol $Vol -Offset $at -Count $take
+                    $chunk = [int][math]::Min($chunkMax, $runBytes)
+                    $got = 0
+                    while ($got -lt $chunk) {
+                        $n = $Vol.Stream.Read($buf, $got, $chunk - $got)
+                        if ($n -le 0) { break }
+                        $got += $n
+                    }
+                    if ($got -lt $chunk) { throw "short read at cluster $($run.Lcn) ($got of $chunk bytes)" }
+                    $take = [int][math]::Min([long]$chunk, $left)
                     $out.Write($buf, 0, $take)
-                    $at += $take; $runBytes -= $take; $left -= $take
+                    $runBytes -= $chunk; $left -= $take
                 }
             }
         }
     }
     finally { $out.Dispose() }
+    # The base record holds every run only for unfragmented metafiles; anything else
+    # spills into extension records, and a silently short file must not pass as complete.
+    if ($left -gt 0) {
+        throw ("incomplete: data runs cover {0} of {1} bytes (file too fragmented for the base record)" -f ($data.RealSize - $left), $data.RealSize)
+    }
 }
 
 function Collect-RawNtfs {
-    $vol = $null
-    try { $vol = Open-NtfsVolume -Drive 'C' }
-    catch {
-        Write-Manifest -Action 'ntfs_raw' -Command 'open \\.\C:' -Target $null -Category 'disk' `
-            -ExitCode $null -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'degraded' -Message $_.Exception.Message
-        Write-Log "  raw NTFS unavailable: $($_.Exception.Message)" 'WARN'
+    # Reading from the shadow copy keeps the metafiles consistent with the hives taken
+    # from the same snapshot, and nothing moves underneath a multi-GB read.
+    param([string]$Device)
+    $vol = $null; $from = $null; $why = 'no source'
+    foreach ($path in @($Device, '\\.\C:')) {
+        if (-not $path) { continue }
+        try { $vol = Open-NtfsVolume -Path $path; $from = $path; break }
+        catch { $why = $_.Exception.Message }
+    }
+    if (-not $vol) {
+        Write-Manifest -Action 'ntfs_raw' -Command 'open raw volume' -Target $null -Category 'disk' `
+            -ExitCode $null -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'degraded' -Message $why
+        Write-Log "  raw NTFS unavailable: $why" 'WARN'
         return
     }
     try {
-        Write-Log ("  NTFS: {0}-byte clusters, {1}-byte MFT records" -f $vol.ClusterSize, $vol.RecordSize)
+        Write-Log ("  source {0}: {1}-byte clusters, {2}-byte MFT records" -f $from, $vol.ClusterSize, $vol.RecordSize)
         foreach ($m in @(@{ N = 0; F = '$MFT' }, @{ N = 2; F = '$LogFile' })) {
             $target = Join-Path $outRoot ('C\' + $m.F)
             Invoke-Step -Action 'ntfs_raw' -Category 'disk' -Command ("raw read {0} (MFT record {1})" -f $m.F, $m.N) `
@@ -598,13 +647,18 @@ function Collect-Disk {
     Write-Log "Collecting disk artifacts (C\ volume layout) [profile=$Profile]"
     $sys32 = Join-Path $outRoot 'C\Windows\System32'
 
-    # Registry hives (locked -> reg save reads them live)
-    $hives = @{ 'SYSTEM' = 'HKLM\SYSTEM'; 'SOFTWARE' = 'HKLM\SOFTWARE'; 'SAM' = 'HKLM\SAM'; 'SECURITY' = 'HKLM\SECURITY' }
-    foreach ($h in $hives.GetEnumerator()) {
-        $target = Join-Path $sys32 ('config\{0}' -f $h.Key)
-        Invoke-Step -Action 'registry_save' -Category 'disk' `
-            -Command ("reg save {0} `"{1}`" /y" -f $h.Value, $target) -Target $target `
-            -Script { reg save $h.Value $target /y 2>&1 | Out-Null }
+    # Registry hives (locked -> reg save reads them live; the shadow copy covers us if
+    # reg.exe is blocked, so there is no point attempting it four times in that case)
+    $regUsable = Test-BuiltinTool -Exe 'reg.exe' -ProbeArgs @('query', 'HKLM', '/ve') `
+        -Purpose 'registry hives will be taken from the shadow copy instead'
+    if ($regUsable) {
+        $hives = @{ 'SYSTEM' = 'HKLM\SYSTEM'; 'SOFTWARE' = 'HKLM\SOFTWARE'; 'SAM' = 'HKLM\SAM'; 'SECURITY' = 'HKLM\SECURITY' }
+        foreach ($h in $hives.GetEnumerator()) {
+            $target = Join-Path $sys32 ('config\{0}' -f $h.Key)
+            Invoke-Step -Action 'registry_save' -Category 'disk' `
+                -Command ("reg save {0} `"{1}`" /y" -f $h.Value, $target) -Target $target `
+                -Script { reg save $h.Value $target /y 2>&1 | Out-Null }
+        }
     }
 
     # Event logs - EVERY channel present on the system, not a curated subset.
@@ -614,14 +668,18 @@ function Collect-Disk {
     # logs cannot be exported by channel name, so those fall back to a direct file copy.
     $logDir = 'C:\Windows\System32\winevt\Logs'
     if (Test-Path -LiteralPath $logDir) {
+        $wevtUsable = Test-BuiltinTool -Exe 'wevtutil.exe' -ProbeArgs @('gl', 'Application') `
+            -Purpose 'event logs will be copied directly instead of exported'
         Get-ChildItem -LiteralPath $logDir -Filter '*.evtx' -Force -ErrorAction SilentlyContinue | ForEach-Object {
             $file = $_
             $channel = $file.BaseName -replace '%4', '/'
             $target = Join-Path $sys32 ('winevt\Logs\{0}' -f $file.Name)
             # 15007 = channel not registered (archived log); the copy below picks those up.
-            Invoke-Step -Action 'eventlog_export' -Category 'disk' -BenignExitCodes 15007 `
-                -Command ("wevtutil epl `"{0}`" `"{1}`"" -f $channel, $target) -Target $target `
-                -Script { wevtutil epl $channel $target 2>&1 | Out-Null }
+            if ($wevtUsable) {
+                Invoke-Step -Action 'eventlog_export' -Category 'disk' -BenignExitCodes 15007 `
+                    -Command ("wevtutil epl `"{0}`" `"{1}`"" -f $channel, $target) -Target $target `
+                    -Script { wevtutil epl $channel $target 2>&1 | Out-Null }
+            }
             if (-not (Test-Path -LiteralPath $target)) {
                 # Only worth copying if the file is actually readable (archived/unregistered
                 # channels). If the export failed on permissions, a copy fails the same way.
@@ -649,21 +707,47 @@ function Collect-Disk {
     # Scheduled task definitions (persistence T1053)
     Add-DiskTree -Root 'C:\Windows\System32\Tasks'
     Add-DiskTree -Root 'C:\Windows\SysWOW64\Tasks'
+    Add-DiskTree -Root 'C:\Windows\Tasks' -Filter '*.job'   # legacy AT-style jobs
 
     # Standalone config / execution artifacts
     Add-DiskFile -Source 'C:\Windows\System32\drivers\etc\hosts'
     Add-DiskFile -Source 'C:\Windows\AppCompat\pca\PcaAppLaunchDic.txt'   # Win11 plaintext execution log
     Add-DiskFile -Source 'C:\Windows\AppCompat\pca\PcaGeneralDb0.txt'
+    Add-DiskFile -Source 'C:\Windows\appcompat\Programs\RecentFileCache.bcf'
+
+    # Device / removable-media history
+    Add-DiskTree -Root 'C:\Windows\INF' -Filter 'setupapi*.log'
+
+    # Deleted-file records: the $I index entries carry original path, size and delete
+    # time. The matching $R payloads are the deleted content itself and are not copied.
+    Add-DiskTree -Root 'C:\$Recycle.Bin' -Filter '$I*'
+
+    # Endpoint protection history and host firewall
+    Add-DiskTree -Root 'C:\ProgramData\Microsoft\Windows Defender\Support' -Filter 'MPLog-*'
+    Add-DiskTree -Root 'C:\ProgramData\Microsoft\Windows Defender\Scans\History\Service'
+    Add-DiskTree -Root 'C:\Windows\System32\LogFiles\Firewall'
+
+    # Background transfer queue (download persistence) and registry backups
+    Add-DiskTree -Root 'C:\ProgramData\Microsoft\Network\Downloader' -Filter 'qmgr*.db'
+    Add-DiskTree -Root 'C:\Windows\System32\config\RegBack'
 
     # All-users startup
     Add-DiskTree -Root 'C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup'
 
-    # Per-user artifacts (non-locked): Recent (LNK + Jump Lists), Startup, PowerShell console history
+    # Per-user artifacts (non-locked): Recent (LNK + Jump Lists), Startup, PowerShell
+    # console history, and the client-side cache of outbound RDP sessions.
     Get-ChildItem 'C:\Users' -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
         $u = $_.FullName
         Add-DiskTree -Root (Join-Path $u 'AppData\Roaming\Microsoft\Windows\Recent')
         Add-DiskTree -Root (Join-Path $u 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup')
         Add-DiskFile -Source (Join-Path $u 'AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt')
+        Add-DiskTree -Root (Join-Path $u 'AppData\Local\Microsoft\Terminal Server Client\Cache')
+    }
+
+    # Server roles, when present - access logs and the user access / SUM database
+    if ($Profile -eq 'full') {
+        Add-DiskTree -Root 'C:\inetpub\logs\LogFiles'
+        Add-DiskTree -Root 'C:\Windows\System32\LogFiles\Sum'
     }
 
     # Windows Error Reporting (faulting-app paths; survives binary deletion) - larger, full only
@@ -676,7 +760,10 @@ function Collect-Disk {
         Write-Manifest -Action 'vss_snapshot' -Command 'n/a' -Target $null -Category 'disk' `
             -ExitCode $null -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'skipped' `
             -Message 'locked-file acquisition (Amcache/SRUM/NTUSER/UsrClass/transaction logs/browser) requires elevation'
-        Write-Log '  locked files skipped - run elevated to acquire them' 'WARN'
+        Write-Manifest -Action 'ntfs_raw' -Command 'n/a' -Target $null -Category 'disk' `
+            -ExitCode $null -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'skipped' `
+            -Message 'raw NTFS access ($MFT / $LogFile) requires elevation'
+        Write-Log '  locked files and NTFS metafiles skipped - run elevated to acquire them' 'WARN'
     }
     else {
         Write-Log 'Acquiring locked files via Volume Shadow Copy...'
@@ -697,6 +784,8 @@ function Collect-Disk {
             }
             # Fallback 2: loaded user hives (NTUSER/UsrClass) need no VSS at all.
             Save-LoadedUserHives
+            Write-Log 'Extracting NTFS metafiles ($MFT, $LogFile) by raw volume read...'
+            Collect-RawNtfs
         }
         else {
             Write-Manifest -Action 'vss_snapshot' -Command 'Win32_ShadowCopy.Create' -Target $null -Category 'disk' `
@@ -724,26 +813,23 @@ function Collect-Disk {
                     Add-ShadowFile $snap "$rel\AppData\Local\Microsoft\Windows\UsrClass.dat"
                     Add-ShadowFile $snap "$rel\AppData\Local\Microsoft\Windows\UsrClass.dat.LOG1"
                     Add-ShadowFile $snap "$rel\AppData\Local\Microsoft\Windows\UsrClass.dat.LOG2"
-                    Add-ShadowFile $snap "$rel\AppData\Local\Google\Chrome\User Data\Default\History"
-                    Add-ShadowFile $snap "$rel\AppData\Local\Microsoft\Edge\User Data\Default\History"
+                    # Every browser profile, not just Default - a second profile is a
+                    # common way to keep activity out of the obvious place.
+                    Add-ShadowTree $snap "$rel\AppData\Local\Google\Chrome\User Data" 'History'
+                    Add-ShadowTree $snap "$rel\AppData\Local\Microsoft\Edge\User Data" 'History'
                     Add-ShadowTree $snap "$rel\AppData\Roaming\Mozilla\Firefox\Profiles" 'places.sqlite'
+                    # Explorer/IE history store and the activity timeline
+                    Add-ShadowFile $snap "$rel\AppData\Local\Microsoft\Windows\WebCache\WebCacheV01.dat"
+                    Add-ShadowTree $snap "$rel\AppData\Local\ConnectedDevicesPlatform" 'ActivitiesCache.db'
                 }
                 # WMI repository (fileless persistence) - larger, full profile only
                 if ($Profile -eq 'full') { Add-ShadowTree $snap 'Windows\System32\wbem\Repository' }
+                # --- Raw NTFS metafiles ($MFT, $LogFile), read from the same snapshot ---
+                Write-Log 'Extracting NTFS metafiles ($MFT, $LogFile) by raw volume read...'
+                Collect-RawNtfs -Device $snap.Cim.DeviceObject
             }
             finally { Remove-ShadowSnapshot $snap }
         }
-    }
-    # --- Raw NTFS metafiles ($MFT, $LogFile) ---
-    if (-not $script:IsElevated) {
-        Write-Manifest -Action 'ntfs_raw' -Command 'n/a' -Target $null -Category 'disk' `
-            -ExitCode $null -Bytes 0 -Sha256 $null -DurationMs 0 -Status 'skipped' `
-            -Message 'raw NTFS access ($MFT / $LogFile) requires elevation'
-        Write-Log '  $MFT / $LogFile skipped - run elevated' 'WARN'
-    }
-    else {
-        Write-Log 'Extracting NTFS metafiles ($MFT, $LogFile) by raw volume read...'
-        Collect-RawNtfs
     }
 
     # --- Historical versions from existing shadow copies (-Vss) ---
