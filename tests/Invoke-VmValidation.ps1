@@ -36,6 +36,10 @@ param(
     # Roll the guest back to the baseline snapshot when finished. The baseline is
     # created on first use and is the only snapshot this script ever touches.
     [switch]$Revert,
+    # Retake the baseline at the guest's current state. Needed after deliberately
+    # changing the guest - otherwise a later -Revert would roll that change away,
+    # because the baseline still describes the guest as it was before.
+    [switch]$RefreshBaseline,
     [switch]$KeepRunning
 )
 
@@ -98,11 +102,16 @@ Write-Host "`nVM validation: $vmName" -ForegroundColor Cyan
 # Created once and never replaced, so a rollback can only ever return the guest to
 # the state it was in before this script first ran.
 $snaps = Vm 'listSnapshots' -Tolerate
+if ($RefreshBaseline -and $snaps -match [regex]::Escape($BASELINE)) {
+    Say "retaking baseline at the guest's current state" 'Yellow'
+    Vm 'deleteSnapshot' @($BASELINE) -Tolerate | Out-Null
+    $snaps = ''
+}
 if ($snaps -notmatch [regex]::Escape($BASELINE)) {
     Say "creating baseline snapshot '$BASELINE'" 'Yellow'
     Vm 'snapshot' @($BASELINE) | Out-Null
 }
-else { Say "baseline snapshot present" }
+else { Say "baseline snapshot present (pass -RefreshBaseline if the guest has changed since)" }
 
 # --- Power on and wait for the guest tools ----------------------------------------
 if ((Vm 'list' -Tolerate) -notmatch [regex]::Escape($Vmx)) {
@@ -119,6 +128,16 @@ do {
 } until ($state -eq 'running' -or (Get-Date) -gt $deadline)
 if ($state -ne 'running') { throw "guest tools never came up (state: $state) - are VMware Tools installed?" }
 Say "guest tools: $state" 'Green'
+
+# Prove the stored credential works before anything depends on it. Some guest
+# operations block rather than return when authentication fails, so a bad password
+# has to be caught here, by a call that is cheap and definitely authenticated.
+$auth = Vm 'listProcessesInGuest' -Guest -Tolerate
+if ($auth -match 'Invalid user name or password') {
+    throw ("guest rejected the stored credential for '$GuestUser' - re-store it with: " +
+        ".\tests\Set-VmCredential.ps1 -Vmx '$Vmx'")
+}
+Say "guest credential accepted ($GuestUser)" 'Green'
 
 Vm 'createDirectoryInGuest' @($GUEST_DIR) -Guest -Tolerate | Out-Null
 
