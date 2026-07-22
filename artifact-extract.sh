@@ -254,9 +254,13 @@ collect_volatile() {
     elif have ifconfig; then
         run_step interfaces 'ifconfig -a' "$LR/network/interfaces.txt" volatile ifconfig -a
     fi
+    # An absent firewall is a finding in itself, so say so rather than leaving the
+    # capture empty - an empty file is indistinguishable from a failed one.
     run_step firewall 'iptables/nft ruleset' "$LR/network/firewall.txt" volatile sh -c '
-        command -v iptables >/dev/null 2>&1 && { echo "# iptables"; iptables -L -n -v 2>/dev/null; echo; }
-        command -v nft >/dev/null 2>&1 && { echo "# nftables"; nft list ruleset 2>/dev/null; }
+        _fw=0
+        command -v iptables >/dev/null 2>&1 && { echo "# iptables"; iptables -L -n -v 2>/dev/null; echo; _fw=1; }
+        command -v nft >/dev/null 2>&1 && { echo "# nftables"; nft list ruleset 2>/dev/null; _fw=1; }
+        [ "$_fw" -eq 0 ] && echo "# no firewall tooling present (iptables/nft not installed)"
         true'
     run_step listening 'lsof -nP -iTCP -sTCP:LISTEN' "$LR/network/listening.txt" volatile sh -c 'command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP -sTCP:LISTEN || echo "lsof not available"'
 
@@ -267,11 +271,15 @@ collect_volatile() {
     run_step uid0_accounts 'awk UID0 /etc/passwd' "$LR/system/uid0_accounts.txt" volatile awk -F: '$3==0{print $1}' /etc/passwd
 
     # --- Persistence live views ---
+    # Most accounts have no crontab, and crontab -l exits non-zero for each of them;
+    # without the trailing true the last such account would fail the whole step.
     run_step crontab_all 'crontab -l per user' "$LR/system/crontabs.txt" volatile sh -c '
         for u in $(cut -d: -f1 /etc/passwd 2>/dev/null); do
           c=$(crontab -l -u "$u" 2>/dev/null)
           [ -n "$c" ] && printf "### %s\n%s\n\n" "$u" "$c"
-        done'
+        done
+        echo "# accounts with no crontab are omitted"
+        true'
     run_step journal_json 'journalctl -o json (recent)' "$LR/system/journal.json" volatile sh -c 'command -v journalctl >/dev/null 2>&1 && journalctl --no-pager -o json -n 20000 2>/dev/null || echo "{}"'
 
     if [ "$PROFILE" = full ]; then
