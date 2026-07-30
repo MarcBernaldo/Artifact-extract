@@ -106,7 +106,16 @@ function Write-Manifest {
         $ExitCode, [long]$Bytes, [string]$Sha256, [int]$DurationMs, [string]$Status,
         [string]$Message
     )
-    $rel = if ($Target) { ($Target.Substring($outRoot.Length)).TrimStart('\', '/').Replace('\', '/') } else { $null }
+    # Paths are recorded relative to the collection root. A target from outside it would
+    # throw on Substring, so it is kept whole rather than costing us the manifest line.
+    $rel = $null
+    if ($Target) {
+        $rel = if ($Target.StartsWith($outRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            $Target.Substring($outRoot.Length)
+        }
+        else { $Target }
+        $rel = $rel.TrimStart('\', '/').Replace('\', '/')
+    }
     $obj = [ordered]@{
         ts_utc      = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
         action      = $Action
@@ -120,8 +129,13 @@ function Write-Manifest {
         status      = $Status
     }
     if ($Message) { $obj.message = $Message }
-    $json = ($obj | ConvertTo-Json -Compress -Depth 4)
-    [System.IO.File]::AppendAllText($script:ManifestPath, $json + "`n", $script:Utf8NoBom)
+    # This runs outside Invoke-Step's own try/catch, so a transient lock on the manifest
+    # would otherwise abandon every remaining step in the calling module.
+    try {
+        $json = ($obj | ConvertTo-Json -Compress -Depth 4)
+        [System.IO.File]::AppendAllText($script:ManifestPath, $json + "`n", $script:Utf8NoBom)
+    }
+    catch { Write-Log "  manifest write failed for '$Action': $($_.Exception.Message)" 'WARN' }
     if ($script:Counters.Contains($Status)) { $script:Counters[$Status]++ }
     $script:Counters.bytes += $Bytes
 }
@@ -139,7 +153,7 @@ function Invoke-Step {
         [int[]]$BenignExitCodes = @()
     )
     $parent = Split-Path -Parent $Target
-    if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    if ($parent -and -not (Test-Path -LiteralPath $parent -ErrorAction SilentlyContinue)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
 
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $status = 'ok'; $message = $null; $exit = $null
@@ -173,7 +187,7 @@ function Invoke-Step {
     $sw.Stop()
 
     $bytes = 0L; $sha = $null
-    if (Test-Path -LiteralPath $Target -PathType Leaf) {
+    if (Test-Path -LiteralPath $Target -PathType Leaf -ErrorAction SilentlyContinue) {
         # -Force/-LiteralPath so hidden/system files (desktop.ini, NTUSER.*) and paths with
         # wildcard chars are handled; hashing failures degrade the step, never abort the run.
         try {
@@ -303,7 +317,7 @@ function Add-ShadowFile {
     $src = $Snap.Root.TrimEnd('\') + '\' + $Rel
     if (-not [System.IO.File]::Exists($src)) { return }
     # Never overwrite something already collected (e.g. a hive saved by reg save).
-    if (Test-Path -LiteralPath (Join-Path $outRoot (Join-Path 'C' $Rel))) { return }
+    if (Test-Path -LiteralPath (Join-Path $outRoot (Join-Path 'C' $Rel)) -ErrorAction SilentlyContinue) { return }
     Copy-ShadowPath -Src $src -Rel $Rel
 }
 
@@ -676,7 +690,7 @@ function Collect-Disk {
     # ('%4' is the escaped '/'). wevtutil handles the live lock; archived or unregistered
     # logs cannot be exported by channel name, so those fall back to a direct file copy.
     $logDir = 'C:\Windows\System32\winevt\Logs'
-    if (Test-Path -LiteralPath $logDir) {
+    if (Test-Path -LiteralPath $logDir -ErrorAction SilentlyContinue) {
         $wevtUsable = Test-BuiltinTool -Exe 'wevtutil.exe' -ProbeArgs @('gl', 'Application') `
             -Purpose 'event logs will be copied directly instead of exported'
         Get-ChildItem -LiteralPath $logDir -Filter '*.evtx' -Force -ErrorAction SilentlyContinue | ForEach-Object {
@@ -689,7 +703,7 @@ function Collect-Disk {
                     -Command ("wevtutil epl `"{0}`" `"{1}`"" -f $channel, $target) -Target $target `
                     -Script { wevtutil epl $channel $target 2>&1 | Out-Null }
             }
-            if (-not (Test-Path -LiteralPath $target)) {
+            if (-not (Test-Path -LiteralPath $target -ErrorAction SilentlyContinue)) {
                 # Only worth copying if the file is actually readable (archived/unregistered
                 # channels). If the export failed on permissions, a copy fails the same way.
                 $readable = $false
@@ -705,7 +719,7 @@ function Collect-Disk {
 
     # Prefetch (readable copies; requires admin to enumerate)
     $pfDir = 'C:\Windows\Prefetch'
-    if (Test-Path $pfDir) {
+    if (Test-Path -LiteralPath $pfDir -ErrorAction SilentlyContinue) {
         Get-ChildItem -Path $pfDir -Filter '*.pf' -ErrorAction SilentlyContinue | ForEach-Object {
             $target = Join-Path $outRoot ('C\Windows\Prefetch\{0}' -f $_.Name)
             Invoke-Step -Action 'file_copy' -Category 'disk' `
@@ -1016,31 +1030,48 @@ function Compress-Collection {
     $parent  = Split-Path -Parent $outRoot
     $leaf    = Split-Path -Leaf $outRoot
     $archive = "$outRoot.zip"
-    if (Test-Path $archive) { Remove-Item $archive -Force }
+    if (Test-Path -LiteralPath $archive -ErrorAction SilentlyContinue) { Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue }
     Write-Log "Compressing collection -> $leaf.zip"
 
     $ok = $false
+    # Each attempt gets its own catch. Sharing one would let tar failing - including by
+    # writing to stderr, which this PowerShell edition turns into a terminating error -
+    # skip the very fallback that exists to handle tar failing.
     try {
         if (Get-Command tar.exe -ErrorAction SilentlyContinue) {
             $global:LASTEXITCODE = 0
             tar.exe -a -cf $archive -C $parent $leaf 2>&1 | Out-Null
-            $ok = ($LASTEXITCODE -eq 0 -and (Test-Path $archive))
-        }
-        if (-not $ok) {   # fallback: native PowerShell zip
-            Compress-Archive -Path $outRoot -DestinationPath $archive -Force
-            $ok = Test-Path $archive
+            $ok = ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $archive -ErrorAction SilentlyContinue))
         }
     }
-    catch { Write-Log "  compression error: $($_.Exception.Message)" 'WARN'; $ok = $false }
+    catch { Write-Log "  tar failed, falling back: $($_.Exception.Message)" 'WARN'; $ok = $false }
+
+    if (-not $ok) {
+        try {
+            Compress-Archive -Path $outRoot -DestinationPath $archive -Force
+            $ok = Test-Path -LiteralPath $archive -ErrorAction SilentlyContinue
+        }
+        catch { Write-Log "  compression error: $($_.Exception.Message)" 'WARN'; $ok = $false }
+    }
 
     if ($ok) {
-        $hash = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLower()
-        [System.IO.File]::WriteAllText("$archive.sha256", "$hash  $leaf.zip`n", $script:Utf8NoBom)
-        $size = (Get-Item $archive).Length
-        Write-Log ("  archive: {0} ({1:N1} MB) sha256={2}" -f "$leaf.zip", ($size / 1MB), $hash)
-        if (-not $KeepFolder) {
-            Write-Log '  removing working folder (use -KeepFolder to retain it)'
-            Remove-Item $outRoot -Recurse -Force
+        # The archive exists; from here nothing may throw, or the collection would end up
+        # packed but unsealed - or worse, with the working folder already deleted.
+        try {
+            $hash = (Get-FileHash -Path $archive -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+            [System.IO.File]::WriteAllText("$archive.sha256", "$hash  $leaf.zip`n", $script:Utf8NoBom)
+            $size = (Get-Item -LiteralPath $archive -ErrorAction SilentlyContinue).Length
+            Write-Log ("  archive: {0} ({1:N1} MB) sha256={2}" -f "$leaf.zip", ($size / 1MB), $hash)
+            if (-not $KeepFolder) {
+                Write-Log '  removing working folder (use -KeepFolder to retain it)'
+                Remove-Item -LiteralPath $outRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+        catch {
+            # An unsealed archive is still evidence, but the operator has to be told it is
+            # unsealed, and the working folder is kept so nothing is lost.
+            Write-Log "  archive written but sealing it failed: $($_.Exception.Message)" 'WARN'
+            Write-Log '  keeping the working folder - verify the archive manually' 'WARN'
         }
         $script:FinalArtifact = $archive
     }
@@ -1075,9 +1106,18 @@ if (-not $script:CanRunNative) {
         -Message 'host cannot launch native executables; hives/event logs/locked files unavailable'
 }
 
-# metadata.json
-$os = Get-CimInstance Win32_OperatingSystem
-$scriptHash = if ($PSCommandPath -and (Test-Path $PSCommandPath)) { (Get-FileHash -Path $PSCommandPath -Algorithm SHA256).Hash.ToLower() } else { $null }
+# metadata.json. Everything here is descriptive, so nothing in it may abort the run: a
+# damaged WMI repository is both a plausible host state and a finding in its own right,
+# and a host that cannot describe itself must still be collected from.
+$os = try { Get-CimInstance Win32_OperatingSystem -ErrorAction Stop } catch { $null }
+$timeZoneId = try { (Get-TimeZone -ErrorAction Stop).Id } catch { $null }
+$scriptHash = $null
+try {
+    if ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue)) {
+        $scriptHash = (Get-FileHash -Path $PSCommandPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+    }
+}
+catch { Write-Log "  could not hash the running script: $($_.Exception.Message)" 'WARN' }
 $metadata = [ordered]@{
     collector          = 'artifact-extract'
     collector_version  = $script:CollectorVersion
@@ -1089,7 +1129,7 @@ $metadata = [ordered]@{
     architecture       = $env:PROCESSOR_ARCHITECTURE
     user               = $identity.Name
     elevated           = $script:IsElevated
-    timezone           = (Get-TimeZone).Id
+    timezone           = $timeZoneId
     utc_offset         = $utcOffset
     started_utc        = $script:StartUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
     started_local      = (Get-Date).ToString('o')
@@ -1137,11 +1177,15 @@ if ([math]::Abs($skew) -gt 60) {
 # Seal the manifest, then pack everything into a single archive. Nothing may append to
 # the manifest past this point: the seal would no longer describe the file, and a run
 # that honestly recorded a clock change would look indistinguishable from a tampered one.
-if (Test-Path $script:ManifestPath) {
-    $manifestHash = (Get-FileHash -Path $script:ManifestPath -Algorithm SHA256).Hash.ToLower()
-    [System.IO.File]::WriteAllText((Join-Path $outRoot 'manifest.sha256'),
-        "$manifestHash  collection_manifest.ndjson`n", $script:Utf8NoBom)
+# Failing to seal must not cost the collection either - it degrades to an unsealed one.
+try {
+    if (Test-Path -LiteralPath $script:ManifestPath -ErrorAction SilentlyContinue) {
+        $manifestHash = (Get-FileHash -Path $script:ManifestPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+        [System.IO.File]::WriteAllText((Join-Path $outRoot 'manifest.sha256'),
+            "$manifestHash  collection_manifest.ndjson`n", $script:Utf8NoBom)
+    }
 }
+catch { Write-Log "  could not seal the manifest: $($_.Exception.Message)" 'WARN' }
 
 Write-Log ("Done in {0:N1}s | ok={1} degraded={2} error={3} skipped={4} | {5:N1} MB" -f `
     $elapsed, $script:Counters.ok, $script:Counters.degraded, $script:Counters.error, `
