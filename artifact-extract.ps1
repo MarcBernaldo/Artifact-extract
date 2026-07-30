@@ -183,6 +183,11 @@ function Invoke-Step {
         catch {
             if ($status -eq 'ok') { $status = 'degraded'; $message = "hash failed: $($_.Exception.Message)" }
         }
+        # An empty file is not a collected artifact. Without this, 'ok' would cover a
+        # zero-byte export with no hash, and an analyst filtering on ok would trust it.
+        if ($bytes -eq 0 -and $status -eq 'ok') {
+            $status = 'degraded'; $message = 'no output produced'
+        }
     }
     elseif ($status -eq 'ok') {
         $status = 'degraded'; $message = 'no output produced'
@@ -1115,13 +1120,6 @@ catch {
         -Message $_.Exception.Message
 }
 
-# Seal the manifest, then pack everything into a single archive.
-if (Test-Path $script:ManifestPath) {
-    $manifestHash = (Get-FileHash -Path $script:ManifestPath -Algorithm SHA256).Hash.ToLower()
-    [System.IO.File]::WriteAllText((Join-Path $outRoot 'manifest.sha256'),
-        "$manifestHash  collection_manifest.ndjson`n", $script:Utf8NoBom)
-}
-
 $elapsed = $script:Clock.Elapsed.TotalSeconds
 # The two clocks disagreeing means the host's moved while we were collecting. That is
 # a chain-of-custody fact, not a cosmetic one: every timestamp written before the jump
@@ -1135,6 +1133,16 @@ if ([math]::Abs($skew) -gt 60) {
         -Message ("host clock moved {0:N0}s during collection; timestamps recorded before the jump are on the earlier clock" -f $skew)
     Write-Log ("Host clock moved {0:N0}s during collection - earlier timestamps reflect the previous clock" -f $skew) 'WARN'
 }
+
+# Seal the manifest, then pack everything into a single archive. Nothing may append to
+# the manifest past this point: the seal would no longer describe the file, and a run
+# that honestly recorded a clock change would look indistinguishable from a tampered one.
+if (Test-Path $script:ManifestPath) {
+    $manifestHash = (Get-FileHash -Path $script:ManifestPath -Algorithm SHA256).Hash.ToLower()
+    [System.IO.File]::WriteAllText((Join-Path $outRoot 'manifest.sha256'),
+        "$manifestHash  collection_manifest.ndjson`n", $script:Utf8NoBom)
+}
+
 Write-Log ("Done in {0:N1}s | ok={1} degraded={2} error={3} skipped={4} | {5:N1} MB" -f `
     $elapsed, $script:Counters.ok, $script:Counters.degraded, $script:Counters.error, `
     $script:Counters.skipped, ($script:Counters.bytes / 1MB))
