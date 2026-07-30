@@ -59,6 +59,11 @@ mkdir -p "$OUTPUT" 2>/dev/null
 
 # --- Environment / clock ------------------------------------------------------------
 HOSTNAME_V=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo unknown)
+# The kernel validates a hostname's length, not its characters, so on a compromised host
+# it can carry slashes or newlines. It becomes a directory name below, so reduce it to
+# something that cannot escape the output root.
+HOSTNAME_V=$(printf '%s' "$HOSTNAME_V" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-64)
+[ -n "$HOSTNAME_V" ] || HOSTNAME_V=unknown
 START_UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 STAMP=$(date -u '+%Y%m%dT%H%M%SZ')
 UTC_OFFSET=$(date '+%z' 2>/dev/null || echo '?')
@@ -75,7 +80,10 @@ sha256_of() {
 
 # --- Output layout ------------------------------------------------------------------
 OUT_ROOT="$OUTPUT/${HOSTNAME_V}_linux_${STAMP}"
-mkdir -p "$OUT_ROOT" || { echo "Cannot create $OUT_ROOT" >&2; exit 1; }
+mkdir -p "$OUTPUT" 2>/dev/null
+# Plain mkdir for the leaf: -p would silently accept a pre-positioned symlink at this
+# predictable path and write the whole collection wherever it points.
+mkdir "$OUT_ROOT" || { echo "Cannot create $OUT_ROOT (already exists?)" >&2; exit 1; }
 OUT_ROOT=$(cd "$OUT_ROOT" && pwd)   # absolutize
 MANIFEST="$OUT_ROOT/collection_manifest.ndjson"
 LOGFILE="$OUT_ROOT/collection.log"
@@ -90,8 +98,14 @@ log() {
     printf '%s\n' "$_line" | tee -a "$LOGFILE"
 }
 
+_TAB=$(printf '\t')
 json_escape() {   # escape a string for embedding in JSON
-    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' | tr -d '\n\r'
+    # A literal tab byte rather than the \t pattern: that form is a GNU/busybox sed
+    # extension, and a strict sed matches a backslash followed by t instead. Remaining
+    # C0 control characters are dropped rather than emitted raw, which is invalid JSON.
+    printf '%s' "$1" \
+      | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/${_TAB}/\\\\t/g" \
+      | tr -d '\001-\010\013\014\016-\037\177' | tr -d '\n\r'
 }
 
 # manifest <action> <command> <target-abs|-> <category> <exit|-> <bytes> <sha> <ms> <status> [message]
@@ -100,7 +114,9 @@ json_escape() {   # escape a string for embedding in JSON
 manifest() {
     _jt="$3"
     if [ "$_jt" = "-" ] || [ -z "$_jt" ]; then _jrel='null'
-    else _jrel="\"$(json_escape "$(printf '%s' "$_jt" | sed "s#^$OUT_ROOT/##")")\""; fi
+    # Quoted parameter expansion, not sed: a path is not a regex, and splicing one into
+    # a pattern makes any . * \ or # in it change the match instead of being stripped.
+    else _jrel="\"$(json_escape "${_jt#"$OUT_ROOT"/}")\""; fi
     _jexit="$5"; [ "$_jexit" = "-" ] && _jexit='null'
     _jsha="$7"; if [ -z "$_jsha" ]; then _jsha='null'; else _jsha="\"$_jsha\""; fi
     _jmsg=''
@@ -156,10 +172,22 @@ copy_artifact() {
 # ==================================================================================
 #  Collection modules
 # ==================================================================================
+# Consume a file list, by path, in the CURRENT shell, then discard the list.
+# It must be called as a plain command and never as the right-hand side of a pipeline:
+# POSIX runs every stage of a pipeline in a subshell, so counters incremented in there
+# are lost when it closes, silently understating the run summary.
+# The list lives beside the collection, never inside it, and is removed either way.
+copy_list() {
+    while IFS= read -r f; do copy_artifact "$f"; done < "$1"
+    rm -f "$1"
+}
+
 # Copy every file under a directory tree into [root]/ (bounded depth).
 copy_tree() {
     [ -d "$1" ] || return 0
-    find "$1" -maxdepth "${2:-6}" -type f 2>/dev/null | while IFS= read -r f; do copy_artifact "$f"; done
+    _ct_tmp="$OUT_ROOT.filelist.$$"
+    find "$1" -maxdepth "${2:-6}" -type f 2>/dev/null > "$_ct_tmp"
+    copy_list "$_ct_tmp"
 }
 
 collect_disk() {
@@ -179,8 +207,9 @@ collect_disk() {
     # Covers auth/secure, audit, wtmp/btmp/lastlog, syslog/messages, cron, kernel, package
     # managers and web servers, including rotated and compressed files. The binary journal
     # is excluded here (large; exported as JSON in live_response, copied raw under --profile full).
-    find /var/log -maxdepth 8 -type f 2>/dev/null | grep -v '/var/log/journal/' \
-        | while IFS= read -r f; do copy_artifact "$f"; done
+    _vl_tmp="$OUT_ROOT.filelist.$$"
+    find /var/log -maxdepth 8 -type f 2>/dev/null | grep -v '/var/log/journal/' > "$_vl_tmp"
+    copy_list "$_vl_tmp"
 
     # --- Persistence: cron, systemd, rc/init, PAM, ld.so, MOTD ---
     for d in /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly \
@@ -188,8 +217,10 @@ collect_disk() {
         copy_tree "$d" 2
     done
     for d in /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system /etc/systemd/user; do
-        [ -d "$d" ] && find "$d" -maxdepth 2 -type f \( -name '*.service' -o -name '*.timer' \) 2>/dev/null \
-            | while IFS= read -r f; do copy_artifact "$f"; done
+        [ -d "$d" ] || continue
+        _sd_tmp="$OUT_ROOT.filelist.$$"
+        find "$d" -maxdepth 2 -type f \( -name '*.service' -o -name '*.timer' \) 2>/dev/null > "$_sd_tmp"
+        copy_list "$_sd_tmp"
     done
     copy_artifact /etc/rc.local
     copy_artifact /etc/ld.so.preload         # any entry here is a critical rootkit red flag
@@ -228,7 +259,12 @@ collect_volatile() {
 
     # --- System ---
     run_step system_info 'uname -a' "$LR/system/uname.txt" volatile uname -a
-    run_step date_utc 'date -u' "$LR/system/date_utc.txt" volatile sh -c "date -u; echo \"tz=$TZ_NAME offset=$UTC_OFFSET\""
+    # Exported and consumed as %s arguments: these come from the host's timezone data,
+    # which root can craft, and a double-quoted body would let the child shell re-parse
+    # their contents as code.
+    export TZ_NAME UTC_OFFSET
+    run_step date_utc 'date -u' "$LR/system/date_utc.txt" volatile sh -c 'date -u; printf "tz=%s offset=%s
+" "$TZ_NAME" "$UTC_OFFSET"'
     run_step uptime 'uptime' "$LR/system/uptime.txt" volatile sh -c 'uptime 2>/dev/null; echo; cat /proc/uptime 2>/dev/null'
 
     # --- Processes (incl. per-PID /proc detail to flag deleted/fileless binaries) ---
@@ -237,9 +273,9 @@ collect_volatile() {
     run_step proc_detail '/proc/<pid>/{exe,cmdline,cwd}' "$LR/process/proc_detail.txt" volatile sh -c '
         for p in /proc/[0-9]*; do
           pid=${p#/proc/}
-          exe=$(readlink "$p/exe" 2>/dev/null)
-          cwd=$(readlink "$p/cwd" 2>/dev/null)
-          cmd=$(tr "\0" " " < "$p/cmdline" 2>/dev/null)
+          exe=$(readlink "$p/exe" 2>/dev/null | tr "\n\t" "  ")
+          cwd=$(readlink "$p/cwd" 2>/dev/null | tr "\n\t" "  ")
+          cmd=$(tr "\000\n\t" "   " < "$p/cmdline" 2>/dev/null)
           [ -n "$exe$cmd" ] && printf "PID=%s EXE=%s CWD=%s CMD=%s\n" "$pid" "$exe" "$cwd" "$cmd"
         done'
 
@@ -274,7 +310,7 @@ collect_volatile() {
     # Most accounts have no crontab, and crontab -l exits non-zero for each of them;
     # without the trailing true the last such account would fail the whole step.
     run_step crontab_all 'crontab -l per user' "$LR/system/crontabs.txt" volatile sh -c '
-        for u in $(cut -d: -f1 /etc/passwd 2>/dev/null); do
+        cut -d: -f1 /etc/passwd 2>/dev/null | while IFS= read -r u; do
           c=$(crontab -l -u "$u" 2>/dev/null)
           [ -n "$c" ] && printf "### %s\n%s\n\n" "$u" "$c"
         done
@@ -291,7 +327,7 @@ collect_volatile() {
         run_step open_files 'lsof -nP' "$LR/system/lsof.txt" volatile sh -c 'command -v lsof >/dev/null 2>&1 && lsof -nP 2>/dev/null || echo "lsof unavailable"'
         run_step auditd_status 'auditctl -s/-l' "$LR/system/auditd.txt" volatile sh -c 'command -v auditctl >/dev/null 2>&1 && { auditctl -s 2>/dev/null; echo; auditctl -l 2>/dev/null; } || echo "auditctl unavailable"'
         run_step containers 'docker ps -a' "$LR/system/containers.txt" volatile sh -c 'command -v docker >/dev/null 2>&1 && docker ps -a 2>/dev/null; [ -f /.dockerenv ] && echo "INSIDE CONTAINER (/.dockerenv present)"; true'
-        run_step staging_recent 'recent files /tmp /dev/shm /var/tmp' "$LR/system/staging_recent.txt" volatile sh -c 'find /tmp /dev/shm /var/tmp -type f -mtime -7 2>/dev/null | head -500'
+        run_step staging_recent 'recent files /tmp /dev/shm /var/tmp' "$LR/system/staging_recent.txt" volatile sh -c 'find /tmp /dev/shm /var/tmp -type f -mtime -7 2>/dev/null | head -n 500'
     fi
 }
 
@@ -310,7 +346,15 @@ compress_collection() {
     log "Compressing collection -> $_leaf.tar.gz"
     _ok=0
     if tar czf "$_archive" -C "$_parent" "$_leaf" 2>>"$LOGFILE"; then _ok=1
-    elif tar cf - -C "$_parent" "$_leaf" 2>>"$LOGFILE" | gzip -c > "$_archive" 2>>"$LOGFILE"; then _ok=1; fi
+    else
+        # A pipeline reports its LAST command's status, so piping tar into gzip would
+        # report gzip's success over tar's failure - and the working folder is deleted
+        # below on that word. Archive first, compress second, and check tar itself.
+        _tmptar="$OUT_ROOT.tar"
+        if tar cf "$_tmptar" -C "$_parent" "$_leaf" 2>>"$LOGFILE" &&
+           gzip -c "$_tmptar" > "$_archive" 2>>"$LOGFILE"; then _ok=1; fi
+        rm -f "$_tmptar"
+    fi
     if [ "$_ok" = 1 ] && [ -s "$_archive" ]; then
         _asha=$(sha256_of "$_archive")
         [ -n "$_asha" ] && printf '%s  %s\n' "$_asha" "$_leaf.tar.gz" > "$_archive.sha256"
@@ -349,12 +393,12 @@ cat > "$OUT_ROOT/metadata.json" <<EOF
   "collector_version": "$COLLECTOR_VERSION",
   "collector_sha256": "$SCRIPT_SHA",
   "host": "$(json_escape "$HOSTNAME_V")",
-  "os_name": "$OSNAME",
-  "kernel": "$KERNEL",
-  "user": "$(id -un 2>/dev/null)",
+  "os_name": "$(json_escape "$OSNAME")",
+  "kernel": "$(json_escape "$KERNEL")",
+  "user": "$(json_escape "$(id -un 2>/dev/null)")",
   "root": $([ "$IS_ROOT" = 1 ] && echo true || echo false),
-  "timezone": "$TZ_NAME",
-  "utc_offset": "$UTC_OFFSET",
+  "timezone": "$(json_escape "$TZ_NAME")",
+  "utc_offset": "$(json_escape "$UTC_OFFSET")",
   "started_utc": "$START_UTC",
   "profile": "$PROFILE",
   "categories": "$(echo "$SELECTED" | sed 's/^ //')",
