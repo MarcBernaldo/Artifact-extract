@@ -84,6 +84,18 @@ runs **without** `-interactive` (a headless guest has no desktop session; the ag
 full admin token). Guest passwords come from a DPAPI-protected per-VM file and are decrypted only in
 memory — vmrun requires a plaintext password argument, which is the one unavoidable exposure.
 
+## How changes are made
+
+`docs/DEVELOPMENT.md` defines the process: **evaluate → design → build → review → validate →
+seal**. Read it before adding an artifact or a feature. Two rules that bind Claude directly:
+
+- **Nothing skips the evaluate stage.** A new artifact answers the checklist there (what
+  question does it answer, obtainable natively, already covered, what does it cost, locked by
+  what, does the downstream parser understand it, what is the OS counterpart) and gets a
+  written build/defer/reject verdict before code is written.
+- **The reviewer is never the author.** Use a specialist subagent for domain work (PS 5.1
+  semantics, POSIX portability, forensic soundness) and a *different* one to review it.
+
 ## Conventions specific to this repo
 
 - **Regenerate `SHA256SUMS` after every edit to a collected script.** A stale hash breaks the EDR
