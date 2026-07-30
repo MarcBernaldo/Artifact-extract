@@ -1,6 +1,18 @@
+# Assistant / local tooling notes - kept on disk, never published
+CLAUDE.md
+.claude/
+.cursor/
+.cursorrules
+.aider*
+.github/copilot-instructions.md
+
 # Guest credentials - the store lives outside the repo, these are belt and braces
 *.cred
 .artifact-extract-vm/
+*.key
+*.pem
+.env
+.env.*
 
 # Collection outputs (never commit collected data)
 result/
@@ -21,3 +33,15 @@ manifest.sha256
 # OS / editor cruft
 .DS_Store
 Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.rej
+*.tmp
+*.log
